@@ -67,6 +67,8 @@ LOG_FILE = "insert_log.md"
 OUTPUT_SUFFIX = "_최종"
 ARCHIVE_KEEP = 10
 IMAGE_EXTS = (".png", ".jpg", ".jpeg")  # earlier = preferred on a same-folder tie
+IMAGE_FORMATS = {"PNG", "JPEG"}  # actual content, checked with Pillow
+IGNORED_FILES = {".gitkeep", "thumbs.db", "desktop.ini", ".ds_store"}
 MODE_FIT = "fit"
 MODE_FILL = "fill"
 # Reserved for text the tool may add in later versions (install-local font lock).
@@ -247,6 +249,26 @@ def _scan_slide(slide, slide_no: int, targets: list[Target], report: RunReport) 
     return group_marker
 
 
+def _is_ignorable(path: Path) -> bool:
+    name = path.name.lower()
+    return name in IGNORED_FILES or name.startswith(("~$", "._"))
+
+
+def _unsupported_reason(path: Path) -> Optional[str]:
+    """Return why the file cannot be inserted, or None when it is a usable PNG/JPEG."""
+    ext = path.suffix.lower()
+    if ext not in IMAGE_EXTS:
+        return f"지원하지 않는 형식({ext or '확장자 없음'})"
+    try:
+        with Image.open(path) as img:
+            actual = img.format
+    except (OSError, ValueError):
+        return "이미지를 열 수 없음(손상된 파일)"
+    if actual not in IMAGE_FORMATS:
+        return f"확장자는 {ext}이지만 실제 형식은 {actual}"
+    return None
+
+
 def collect_images(images_root: Path, report: RunReport) -> dict[str, ImageEntry]:
     """Return the newest image per screen ID across YYYY-MM-DD folders."""
     dated: list[tuple[date, Path]] = []
@@ -263,7 +285,7 @@ def collect_images(images_root: Path, report: RunReport) -> dict[str, ImageEntry
                     f"`{IMAGES_DIR}/{folder.name}` 폴더는 날짜 형식(YYYY-MM-DD)이 아니라 건너뜁니다."
                 )
         for loose in images_root.iterdir():
-            if loose.is_file() and loose.suffix.lower() in IMAGE_EXTS:
+            if loose.is_file() and not _is_ignorable(loose):
                 report.warnings.append(
                     f"`{IMAGES_DIR}/{loose.name}` 은 날짜 폴더 밖에 있어 건너뜁니다."
                 )
@@ -272,8 +294,14 @@ def collect_images(images_root: Path, report: RunReport) -> dict[str, ImageEntry
     for _, folder in sorted(dated):  # oldest first; newer folders overwrite
         in_folder: dict[str, ImageEntry] = {}
         for path in sorted(folder.iterdir()):
-            ext = path.suffix.lower()
-            if not path.is_file() or ext not in IMAGE_EXTS:
+            if not path.is_file() or _is_ignorable(path):
+                continue
+            reason = _unsupported_reason(path)
+            if reason:
+                report.warnings.append(
+                    f"`{folder.name}/{path.name}` 건너뜀 — {reason}. "
+                    "피그마에서 PNG(또는 JPG)로 다시 export하세요."
+                )
                 continue
             screen_id = _SCALE_SUFFIX_RE.sub("", path.stem).strip()
             key = _key(screen_id)
