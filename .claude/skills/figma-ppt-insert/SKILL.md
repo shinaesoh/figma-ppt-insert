@@ -11,7 +11,8 @@ description: |
   insert_log.md. Re-running on an already-filled deck replaces the inserted screens
   in the same box. Triggers: "피그마 화면 넣어줘", "피그마 이미지 PPT에 삽입",
   "화면 교체 위치에 이미지 넣어줘", "피그마 export 반영해줘", "화면 이미지 최신으로 교체",
-  "figma screens into ppt", "피그마 삽입 프로젝트 만들어줘". Work is kept per project under
+  "figma screens into ppt", "피그마 삽입 프로젝트 만들어줘", "새 화면 슬라이드도 추가해줘"
+  (adds a cloned screen page for IDs not in the deck). Work is kept per project under
   projects/{name}/ (template, dated images, output, log). Do NOT use for generating or redesigning slides, filling
   text into templates (ppt-template-fill), or extracting marker lists to Excel.
 ---
@@ -67,6 +68,7 @@ python .claude/skills/figma-ppt-insert/scripts/insert.py --project <프로젝트
 | `--new-project <이름>` | 빈 프로젝트 폴더 생성 후 종료 ("○○ 프로젝트 만들어줘") |
 | `--list` | 프로젝트 목록 |
 | `--mode fill` | 영역 채우기(잘림) |
+| `--add-slides` | PPT에 없는 화면 ID 이미지마다 화면 슬라이드를 새로 만듦 ("새 화면 슬라이드도 추가해줘") |
 | `--dry-run` | 매칭 결과만 출력. 저장·보관·로그 기록 안 함 |
 | `--root <경로>` | 프로젝트 폴더를 직접 지정 (테스트용) |
 
@@ -75,6 +77,21 @@ python .claude/skills/figma-ppt-insert/scripts/insert.py --project <프로젝트
 
 순서: 템플릿 1개 확인 → 날짜 폴더에서 ID별 최신 이미지 수집 → 마커·기존 삽입 이미지 탐색 → 삽입 →
 기존 `_최종.pptx`를 `_archive`로 이동(10개 초과분 삭제) → 새 최종본 저장 → `insert_log.md`에 기록.
+
+## 새 화면 슬라이드 (`--add-slides`)
+
+사용자가 새 화면 추가를 요청했을 때만 켠다. 화면ID 표가 있는 덱에서만 동작한다.
+
+| 항목 | 규칙 |
+|---|---|
+| 위치 | 화면 ID 자연 정렬 기준, 더 작은 ID 중 마지막 화면 슬라이드 바로 뒤 (없으면 첫 화면 슬라이드 앞) |
+| 양식 | 그 이웃 슬라이드의 공통 틀만 복제: 표, 작은 그림(로고), 하단 페이지 번호, 내용 테두리(빈 큰 사각형) |
+| 표 | 화면ID = 파일명, 화면명·화면타입·유형·화면 경로 = `(확인 필요)` |
+| 설명 | 화면 영역 오른쪽에 `[확인 필요]` 텍스트 박스 (Pretendard 10pt) |
+| 화면 | 덱에서 가장 흔한 화면 영역에 일반 삽입 규칙으로 배치 |
+| 페이지 번호 | 위치 번호와 일치하던 '페이지' 칸·하단 번호를 새 위치로 갱신 |
+
+보고 시 새 슬라이드 번호와 채워야 할 항목, 목차 등 다른 페이지는 수동 확인이 필요함을 알린다.
 
 ## 실행 후 보고
 
@@ -93,5 +110,5 @@ python .claude/skills/figma-ppt-insert/scripts/insert.py --project <프로젝트
 
 ## 1차 범위 밖
 
-텍스트 자동 채우기, 한 프로젝트에 여러 원본 PPT, 그룹 안 마커, 회전 반영, ID 표시 없는 수동 배치 이미지 인식 등은 구현하지 않는다.
+새 슬라이드의 화면명·설명 자동 채우기, 한 프로젝트에 여러 원본 PPT, 그룹 안 마커, 회전 반영, ID 표시 없는 수동 배치 이미지 인식 등은 구현하지 않는다.
 요청이 들어오면 `README.md`의 '2차 후보'에 추가하고 사용자에게 범위 밖임을 알린다.

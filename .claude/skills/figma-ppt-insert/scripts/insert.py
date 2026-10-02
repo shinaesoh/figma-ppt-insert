@@ -37,6 +37,7 @@ Dependencies:
 from __future__ import annotations
 
 import argparse
+import copy
 import re
 import shutil
 import sys
@@ -52,7 +53,7 @@ try:
     from PIL import Image
     from pptx import Presentation
     from pptx.enum.shapes import MSO_SHAPE_TYPE
-    from pptx.util import Emu, Inches
+    from pptx.util import Emu, Inches, Pt
 except ImportError as exc:  # pragma: no cover - environment guard
     print(
         f"Missing dependency: {exc.name}. Install with: pip install python-pptx Pillow",
@@ -73,16 +74,26 @@ IMAGE_FORMATS = {"PNG", "JPEG"}  # actual content, checked with Pillow
 IGNORED_FILES = {".gitkeep", "thumbs.db", "desktop.ini", ".ds_store"}
 MODE_FIT = "fit"
 MODE_FILL = "fill"
-# Reserved for text the tool may add in later versions (install-local font lock).
+# Font for text this tool adds to slides (install-local font lock).
 FONT_FAMILY = "Pretendard"
 
 TABLE_ID_LABEL = "화면ID"  # compared with whitespace removed, upper-cased
-MIN_SCREEN_AREA_SQIN = 1.0
+MIN_SCREEN_AREA_SQIN = 1.0  # smaller pictures (logos, icons) are never screen targets
 SIMILAR_RATIO_TOLERANCE = 0.15  # e.g. 16:9 vs 16:10 (11%) counts as similar
 PLACE_TOP = "상단 맞춤"
 PLACE_CENTER = "가운데"
 PLACE_FILL = "채우기"
-MIN_PPI = 150  # below this, screen text looks blurry when shown on the slide  # smaller pictures (logos, icons) are never screen targets
+MIN_PPI = 150  # below this, screen text looks blurry when shown on the slide
+PAGE_LABEL = "페이지"
+UNKNOWN_FIELD_LABELS = {"화면명", "화면타입", "유형", "화면경로"}  # left as placeholders on new pages
+PLACEHOLDER = "(확인 필요)"
+DESCRIPTION_PLACEHOLDER = (
+    "[확인 필요] 화면 설명",
+    "피그마 export로 추가된 신규 화면입니다.",
+    "화면명·화면타입·유형·화면 경로와 기능 설명을 입력하세요.",
+)
+FOOTER_ZONE = 0.9  # shapes below this share of the slide height are footer (page number)
+FRAME_MIN_SHARE = 0.4  # empty rectangle covering this share of the slide = content frame
 PIC_NAME_PREFIX = "FIGMA:"
 REGION_TAG = "figma-ppt-insert region_in="
 
@@ -90,6 +101,8 @@ _MARKER_RE = re.compile(r"\[\s*화면\s*교체\s*위치\s*[:：]\s*(?P<id>[^\]\s
 _DATE_DIR_RE = re.compile(r"\d{4}-\d{2}-\d{2}")
 _SCALE_SUFFIX_RE = re.compile(r"@\d+(?:\.\d+)?x$", re.IGNORECASE)
 _BAD_PROJECT_CHARS_RE = re.compile(r'[\\/:*?"<>|]')
+_NUMBER_SPLIT_RE = re.compile(r"(\d+)")
+_R_NS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
 _REGION_RE = re.compile(re.escape(REGION_TAG) + r"([-\d.]+),([-\d.]+),([-\d.]+),([-\d.]+)")
 
 
@@ -452,6 +465,210 @@ def run_insert(prs, images: dict[str, ImageEntry], mode: str, report: RunReport)
     report.unused_images = [img for key, img in sorted(images.items()) if key not in used]
 
 
+def _natural_key(text: str) -> list:
+    return [int(part) if part.isdigit() else part.upper() for part in _NUMBER_SPLIT_RE.split(text)]
+
+
+def _id_table(slide):
+    for shape in slide.shapes:
+        if getattr(shape, "has_table", False) and shape.has_table:
+            for row in shape.table.rows:
+                if any(_label(c.text) == TABLE_ID_LABEL for c in row.cells):
+                    return shape.table
+    return None
+
+
+def _label(text: str) -> str:
+    return re.sub(r"\s+", "", text).upper()
+
+
+def _set_text(text_frame, value: str) -> None:
+    """Replace the text while keeping the first run's formatting."""
+    paragraphs = text_frame.paragraphs
+    for extra in paragraphs[1:]:
+        extra._p.getparent().remove(extra._p)
+    runs = paragraphs[0].runs
+    if runs:
+        runs[0].text = value
+        for run in runs[1:]:
+            run._r.getparent().remove(run._r)
+    else:
+        paragraphs[0].text = value
+
+
+def _in_footer(shape, slide_height: float) -> bool:
+    return _emu_to_in(shape.top) >= slide_height * FOOTER_ZONE
+
+
+def _page_number_frames(slide, page_no: int, slide_height: float) -> list:
+    """Text frames that show this slide's page number (footer box, "페이지" table cell)."""
+    wanted = str(page_no)
+    frames = []
+    for shape in slide.shapes:
+        if getattr(shape, "has_table", False) and shape.has_table:
+            for row in shape.table.rows:
+                cells = list(row.cells)
+                for idx, cell in enumerate(cells[:-1]):
+                    if _label(cell.text) == PAGE_LABEL and cells[idx + 1].text.strip() == wanted:
+                        frames.append(cells[idx + 1].text_frame)
+        elif (
+            getattr(shape, "has_text_frame", False)
+            and shape.text_frame.text.strip() == wanted
+            and _in_footer(shape, slide_height)
+        ):
+            frames.append(shape.text_frame)
+    return frames
+
+
+def _screen_box(prs) -> Optional[Box]:
+    """Most common box of the existing screenshot across 화면ID slides."""
+    counts: dict[tuple, int] = {}
+    for slide in prs.slides:
+        picture = _largest_picture(slide) if _table_screen_id(slide) else None
+        if picture is not None:
+            box = _shape_box(picture)
+            key = tuple(round(v, 2) for v in (box.left, box.top, box.width, box.height))
+            counts[key] = counts.get(key, 0) + 1
+    if not counts:
+        return None
+    return Box(*max(counts, key=counts.get))
+
+
+def _is_skeleton(shape, page_no: int, slide_area: float, slide_height: float) -> bool:
+    """Shapes every screen page shares: tables, logos, page number, the content frame."""
+    if getattr(shape, "has_table", False) and shape.has_table:
+        return True
+    area = _emu_to_in(shape.width) * _emu_to_in(shape.height)
+    if shape.shape_type == MSO_SHAPE_TYPE.PICTURE:
+        return area < MIN_SCREEN_AREA_SQIN
+    if shape.shape_type == MSO_SHAPE_TYPE.GROUP or not getattr(shape, "has_text_frame", False):
+        return False
+    text = shape.text_frame.text.strip()
+    if text == str(page_no) and _in_footer(shape, slide_height):
+        return True
+    return shape.shape_type == MSO_SHAPE_TYPE.AUTO_SHAPE and not text and area >= slide_area * FRAME_MIN_SHARE
+
+
+def _copy_rels(element, src_part, dst_part) -> None:
+    for node in element.iter():
+        for attr in (f"{{{_R_NS}}}embed", f"{{{_R_NS}}}link", f"{{{_R_NS}}}id"):
+            rid = node.get(attr)
+            if not rid or rid not in src_part.rels:
+                continue
+            rel = src_part.rels[rid]
+            if rel.is_external:
+                new_rid = dst_part.relate_to(rel.target_ref, rel.reltype, is_external=True)
+            else:
+                new_rid = dst_part.relate_to(rel.target_part, rel.reltype)
+            node.set(attr, new_rid)
+
+
+def _clone_screen_slide(prs, src, src_page: int, position: int):
+    """Add a slide at 0-based ``position`` holding only the shared page skeleton of ``src``."""
+    slide = prs.slides.add_slide(src.slide_layout)
+    tree = slide.shapes._spTree
+    for element in list(tree)[2:]:  # keep nvGrpSpPr / grpSpPr
+        tree.remove(element)
+    src_bg = src._element.cSld.bg
+    if src_bg is not None:
+        slide._element.cSld.insert(0, copy.deepcopy(src_bg))
+    slide_height = _emu_to_in(prs.slide_height)
+    slide_area = _emu_to_in(prs.slide_width) * slide_height
+    for shape in src.shapes:
+        if _is_skeleton(shape, src_page, slide_area, slide_height):
+            element = copy.deepcopy(shape._element)
+            _copy_rels(element, src.part, slide.part)
+            tree.append(element)
+    id_list = prs.slides._sldIdLst
+    entry = id_list[-1]
+    id_list.remove(entry)
+    id_list.insert(position, entry)
+    return slide
+
+
+def _fill_new_slide(slide, screen_id: str, page_no: int, src_page: int, screen: Box, prs) -> None:
+    table = _id_table(slide)
+    for row in table.rows:
+        cells = list(row.cells)
+        for idx, cell in enumerate(cells[:-1]):
+            label = _label(cell.text)
+            if label == TABLE_ID_LABEL:
+                _set_text(cells[idx + 1].text_frame, screen_id)
+            elif label in UNKNOWN_FIELD_LABELS:
+                _set_text(cells[idx + 1].text_frame, PLACEHOLDER)
+    for frame in _page_number_frames(slide, src_page, _emu_to_in(prs.slide_height)):
+        _set_text(frame, str(page_no))
+
+    frame_right = _emu_to_in(prs.slide_width) - 0.3
+    for shape in slide.shapes:
+        if shape.shape_type == MSO_SHAPE_TYPE.AUTO_SHAPE:
+            frame_right = _emu_to_in(shape.left + shape.width) - 0.1
+    left = screen.left + screen.width + 0.3
+    note = slide.shapes.add_textbox(
+        Inches(left), Inches(screen.top), Inches(max(frame_right - left, 1.0)), Inches(screen.height)
+    )
+    note.name = "FIGMA-NOTE"
+    note.text_frame.word_wrap = True
+    for idx, line in enumerate(DESCRIPTION_PLACEHOLDER):
+        paragraph = note.text_frame.paragraphs[0] if idx == 0 else note.text_frame.add_paragraph()
+        paragraph.text = line
+        for run in paragraph.runs:
+            run.font.name = FONT_FAMILY
+            run.font.size = Pt(10)
+
+    marker = slide.shapes.add_textbox(
+        Inches(screen.left), Inches(screen.top), Inches(screen.width), Inches(screen.height)
+    )
+    marker.text_frame.text = f"[화면 교체 위치: {screen_id}]"
+
+
+def add_missing_slides(prs, images: dict[str, ImageEntry], report: RunReport) -> list[str]:
+    """Create a screen page for each image whose ID has no slide yet.
+
+    The new page clones the shared skeleton of the neighboring 화면ID slide,
+    placed in natural ID order, and carries a marker for the regular insert
+    pass. Page numbers of later slides are shifted to match.
+    """
+    present = {_key(t.screen_id) for t in find_targets(prs, RunReport())}
+    new_ids = sorted(
+        (img.screen_id for key, img in images.items() if key not in present), key=_natural_key
+    )
+    if not new_ids:
+        return []
+    screen = _screen_box(prs)
+    if screen is None:
+        report.warnings.append(
+            "화면ID 표가 있는 슬라이드가 없어 새 슬라이드를 만들지 않았습니다 "
+            f"({', '.join(new_ids)})."
+        )
+        return []
+
+    slide_height = _emu_to_in(prs.slide_height)
+    numbered = {
+        slide.slide_id: _page_number_frames(slide, page, slide_height)
+        for page, slide in enumerate(prs.slides, start=1)
+    }
+    added: list[str] = []
+    for screen_id in new_ids:
+        screens = [(i, _table_screen_id(s)) for i, s in enumerate(prs.slides) if _table_screen_id(s)]
+        before = [i for i, sid in screens if _natural_key(sid) < _natural_key(screen_id)]
+        src_index = before[-1] if before else screens[0][0]
+        position = src_index + 1 if before else src_index
+        src = prs.slides[src_index]
+        src_page = src_index + 1  # page numbers are checked against the slide position
+        slide = _clone_screen_slide(prs, src, src_page, position)
+        _fill_new_slide(slide, screen_id, position + 1, src_page, screen, prs)
+        added.append(screen_id)
+
+    for page, slide in enumerate(prs.slides, start=1):
+        for frame in numbered.get(slide.slide_id, []):
+            _set_text(frame, str(page))
+    report.warnings.append(
+        "새 슬라이드를 추가했습니다 — 목차·개정 이력 등 다른 페이지의 화면 목록은 자동으로 바뀌지 않으니 확인하세요."
+    )
+    return added
+
+
 def find_template(template_dir: Path) -> Path:
     candidates = [
         p for p in sorted(template_dir.glob("*.pptx")) if not p.name.startswith("~$")
@@ -505,6 +722,7 @@ def _rel(path: Path, root: Path) -> str:
 def format_report(
     report: RunReport,
     *,
+    added: list[str],
     root: Path,
     template: Path,
     mode: str,
@@ -538,6 +756,13 @@ def format_report(
             )
     else:
         lines.append("- 없음")
+    if added:
+        new_pages = [t for t, _, _ in report.inserted if _key(t.screen_id) in {_key(a) for a in added}]
+        lines += ["", f"### 새 슬라이드 추가 ({len(added)})", ""]
+        lines += [
+            f"- 슬라이드 {t.slide_no}: `{t.screen_id}` — 화면명·화면타입·유형·화면 경로·설명 {PLACEHOLDER}"
+            for t in new_pages
+        ]
     lines += ["", f"### 매칭 실패 — 마커는 있는데 이미지 없음 ({len(report.missing_image)})", ""]
     lines += [f"- 슬라이드 {t.slide_no}: `{t.screen_id}`" for t in report.missing_image] or ["- 없음"]
     lines += ["", f"### 이미지 없음 — 화면ID 슬라이드, 기존 화면 유지 ({len(report.kept_existing)})", ""]
@@ -636,6 +861,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="fit: keep ratio inside the box (default); fill: cover the box and crop",
     )
     parser.add_argument(
+        "--add-slides",
+        action="store_true",
+        help="add a screen page (cloned layout) for images whose ID has no slide yet",
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
         help="report matches only; do not save, archive, or log",
@@ -668,6 +898,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     report = RunReport()
     images = collect_images(root / IMAGES_DIR, report)
     prs = Presentation(str(template))
+    added = add_missing_slides(prs, images, report) if args.add_slides else []
     run_insert(prs, images, args.mode, report)
 
     final_path: Optional[Path] = None
@@ -686,6 +917,7 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     entry = format_report(
         report,
+        added=added,
         root=root,
         template=template,
         mode=args.mode,
