@@ -14,20 +14,22 @@ into the target box; the marker / old picture is removed.
 All geometry is computed in inches; image pixels are used only for the
 unitless aspect ratio.
 
-Work folder layout (default: repository root):
-    01_template/                 one source .pptx with markers
-    02_images/YYYY-MM-DD/        exports per date; newest folder wins per ID
-    03_output/{name}_최종.pptx   latest result
-    03_output/_archive/          previous results (newest 10 kept)
-    insert_log.md                cumulative run log
+Project layout (one folder per project under <repo>/projects/):
+    projects/{project}/01_template/                one source .pptx
+    projects/{project}/02_images/YYYY-MM-DD/       exports per date; newest folder wins per ID
+    projects/{project}/03_output/{name}_최종.pptx  latest result
+    projects/{project}/03_output/_archive/         previous results (newest 10 kept)
+    projects/{project}/insert_log.md               cumulative run log
 
 Usage:
     python3 .claude/skills/figma-ppt-insert/scripts/insert.py [options]
 
 Examples:
-    python3 .claude/skills/figma-ppt-insert/scripts/insert.py
-    python3 .claude/skills/figma-ppt-insert/scripts/insert.py --mode fill
-    python3 .claude/skills/figma-ppt-insert/scripts/insert.py --dry-run
+    python3 .claude/skills/figma-ppt-insert/scripts/insert.py --new-project IMS
+    python3 .claude/skills/figma-ppt-insert/scripts/insert.py --project IMS
+    python3 .claude/skills/figma-ppt-insert/scripts/insert.py --project IMS --mode fill
+    python3 .claude/skills/figma-ppt-insert/scripts/insert.py --project IMS --dry-run
+    python3 .claude/skills/figma-ppt-insert/scripts/insert.py --list
 
 Dependencies:
     python-pptx, Pillow
@@ -58,7 +60,7 @@ except ImportError as exc:  # pragma: no cover - environment guard
     )
     raise SystemExit(1)
 
-DEFAULT_ROOT = REPO_ROOT
+PROJECTS_DIR = REPO_ROOT / "projects"
 TEMPLATE_DIR = "01_template"
 IMAGES_DIR = "02_images"
 OUTPUT_DIR = "03_output"
@@ -87,6 +89,7 @@ REGION_TAG = "figma-ppt-insert region_in="
 _MARKER_RE = re.compile(r"\[\s*화면\s*교체\s*위치\s*[:：]\s*(?P<id>[^\]\s]+)\s*\]")
 _DATE_DIR_RE = re.compile(r"\d{4}-\d{2}-\d{2}")
 _SCALE_SUFFIX_RE = re.compile(r"@\d+(?:\.\d+)?x$", re.IGNORECASE)
+_BAD_PROJECT_CHARS_RE = re.compile(r'[\\/:*?"<>|]')
 _REGION_RE = re.compile(re.escape(REGION_TAG) + r"([-\d.]+),([-\d.]+),([-\d.]+),([-\d.]+)")
 
 
@@ -514,6 +517,7 @@ def format_report(
     lines = [
         f"## {started:%Y-%m-%d %H:%M} 실행",
         "",
+        f"- 프로젝트: `{root.name}`",
         f"- 템플릿: `{_rel(template, root)}`",
         f"- 배치 방식: {mode_label}",
         f"- 결과 파일: `{_rel(final_path, root)}`" if final_path else "- 결과 파일: (미리보기 실행 — 저장 안 함)",
@@ -563,16 +567,67 @@ def configure_utf8_stdio() -> None:
             stream.reconfigure(encoding="utf-8", errors="replace")
 
 
+def list_projects() -> list[str]:
+    if not PROJECTS_DIR.is_dir():
+        return []
+    return sorted(p.name for p in PROJECTS_DIR.iterdir() if p.is_dir() and not p.name.startswith("."))
+
+
+def create_project(name: str) -> Path:
+    """Create the folder skeleton for a new project and return its root."""
+    clean = name.strip()
+    if not clean or clean.startswith(".") or clean.endswith(".") or _BAD_PROJECT_CHARS_RE.search(clean):
+        raise RuntimeError(
+            f"프로젝트 이름 `{name}`은 쓸 수 없습니다. "
+            '\\ / : * ? " < > | 문자와 앞뒤 점(.)은 빼 주세요.'
+        )
+    root = PROJECTS_DIR / clean
+    if root.exists():
+        raise RuntimeError(f"`projects/{clean}` 프로젝트가 이미 있습니다.")
+    for sub in (TEMPLATE_DIR, IMAGES_DIR, OUTPUT_DIR):
+        (root / sub).mkdir(parents=True)
+    return root
+
+
+def resolve_project(name: Optional[str]) -> Path:
+    """Return the project root for --project, or the only project when omitted."""
+    projects = list_projects()
+    available = ", ".join(projects) or "없음"
+    if name:
+        root = PROJECTS_DIR / name.strip()
+        if not root.is_dir():
+            raise RuntimeError(
+                f"`projects/{name}` 프로젝트가 없습니다 (현재 프로젝트: {available}). "
+                "새로 만들려면 --new-project를 쓰세요."
+            )
+        return root
+    if len(projects) == 1:
+        return PROJECTS_DIR / projects[0]
+    if not projects:
+        raise RuntimeError("프로젝트가 없습니다. --new-project <이름>으로 먼저 만드세요.")
+    raise RuntimeError(f"프로젝트를 --project로 지정하세요 (현재 프로젝트: {available}).")
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Insert Figma-exported screens into PPT marker shapes.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument(
+    target = parser.add_mutually_exclusive_group()
+    target.add_argument(
+        "--project",
+        help="project folder name under projects/ (optional when only one exists)",
+    )
+    target.add_argument(
+        "--new-project",
+        metavar="NAME",
+        help="create projects/NAME with empty 01_template / 02_images / 03_output and exit",
+    )
+    target.add_argument("--list", action="store_true", help="list projects and exit")
+    target.add_argument(
         "--root",
         type=Path,
-        default=DEFAULT_ROOT,
-        help=f"work folder (default: {DEFAULT_ROOT})",
+        help="use this folder directly as the project root (for testing)",
     )
     parser.add_argument(
         "--mode",
@@ -591,14 +646,24 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: Optional[list[str]] = None) -> int:
     configure_utf8_stdio()
     args = build_parser().parse_args(argv)
-    root: Path = args.root.resolve()
-    started = datetime.now()
-
+    if args.list:
+        print("\n".join(list_projects()) or "(프로젝트 없음)")
+        return 0
     try:
+        if args.new_project:
+            root = create_project(args.new_project)
+            print(
+                f"`projects/{root.name}` 프로젝트를 만들었습니다.\n"
+                f"- 원본 PPT 1개 → projects/{root.name}/{TEMPLATE_DIR}/\n"
+                f"- 피그마 이미지 → projects/{root.name}/{IMAGES_DIR}/YYYY-MM-DD/"
+            )
+            return 0
+        root = args.root.resolve() if args.root else resolve_project(args.project)
         template = find_template(root / TEMPLATE_DIR)
     except RuntimeError as exc:
         print(f"오류: {exc}", file=sys.stderr)
         return 1
+    started = datetime.now()
 
     report = RunReport()
     images = collect_images(root / IMAGES_DIR, report)

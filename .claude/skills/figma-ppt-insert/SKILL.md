@@ -11,7 +11,8 @@ description: |
   insert_log.md. Re-running on an already-filled deck replaces the inserted screens
   in the same box. Triggers: "피그마 화면 넣어줘", "피그마 이미지 PPT에 삽입",
   "화면 교체 위치에 이미지 넣어줘", "피그마 export 반영해줘", "화면 이미지 최신으로 교체",
-  "figma screens into ppt". Do NOT use for generating or redesigning slides, filling
+  "figma screens into ppt", "피그마 삽입 프로젝트 만들어줘". Work is kept per project under
+  projects/{name}/ (template, dated images, output, log). Do NOT use for generating or redesigning slides, filling
   text into templates (ppt-template-fill), or extracting marker lists to Excel.
 ---
 
@@ -20,13 +21,13 @@ description: |
 피그마에서 export한 화면 이미지를 PPT 안의 마커 도형 위치·크기에 맞춰 넣는다.
 비개발자용 사용 안내는 저장소 루트의 `README.md`에 있다.
 
-## 작업 폴더
+## 작업 폴더 (프로젝트별)
 
-저장소 루트 (스크립트 기본값).
+`projects/{프로젝트명}/` 하나가 프로젝트 하나다. 아래 경로는 모두 그 안이다.
 
 | 경로 | 내용 |
 |---|---|
-| `01_template/` | 마커가 들어간 원본 PPT. 정확히 1개 |
+| `01_template/` | 원본 PPT. 정확히 1개 |
 | `02_images/YYYY-MM-DD/` | export 날짜별 이미지 (`.png` / `.jpg`) |
 | `03_output/{원본파일명}_최종.pptx` | 항상 최신 1개 |
 | `03_output/_archive/` | 이전 최종본 `{원본파일명}_YYYYMMDD_HHMM.pptx`, 최근 10개 보관 |
@@ -57,14 +58,20 @@ description: |
 저장소 루트에서:
 
 ```bash
-python .claude/skills/figma-ppt-insert/scripts/insert.py
+python .claude/skills/figma-ppt-insert/scripts/insert.py --project <프로젝트명>
 ```
 
 | 옵션 | 의미 |
 |---|---|
+| `--project <이름>` | 대상 프로젝트. 프로젝트가 하나뿐이면 생략 가능 |
+| `--new-project <이름>` | 빈 프로젝트 폴더 생성 후 종료 ("○○ 프로젝트 만들어줘") |
+| `--list` | 프로젝트 목록 |
 | `--mode fill` | 영역 채우기(잘림) |
 | `--dry-run` | 매칭 결과만 출력. 저장·보관·로그 기록 안 함 |
-| `--root <경로>` | 다른 작업 폴더 사용 |
+| `--root <경로>` | 프로젝트 폴더를 직접 지정 (테스트용) |
+
+프로젝트 선택: 사용자가 이름을 말하면 `--project`로 넘긴다. 말하지 않았는데 프로젝트가 여럿이면
+스크립트가 목록과 함께 오류를 내므로, 목록을 보여 주고 어느 프로젝트인지 묻는다.
 
 순서: 템플릿 1개 확인 → 날짜 폴더에서 ID별 최신 이미지 수집 → 마커·기존 삽입 이미지 탐색 → 삽입 →
 기존 `_최종.pptx`를 `_archive`로 이동(10개 초과분 삭제) → 새 최종본 저장 → `insert_log.md`에 기록.
@@ -86,5 +93,5 @@ python .claude/skills/figma-ppt-insert/scripts/insert.py
 
 ## 1차 범위 밖
 
-텍스트 자동 채우기, 다중 템플릿, 그룹 안 마커, 회전 반영, ID 표시 없는 수동 배치 이미지 인식 등은 구현하지 않는다.
+텍스트 자동 채우기, 한 프로젝트에 여러 원본 PPT, 그룹 안 마커, 회전 반영, ID 표시 없는 수동 배치 이미지 인식 등은 구현하지 않는다.
 요청이 들어오면 `README.md`의 '2차 후보'에 추가하고 사용자에게 범위 밖임을 알린다.
