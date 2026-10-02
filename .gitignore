@@ -1,0 +1,16 @@
+# Work folders — only the folder skeleton is tracked; decks and images stay local
+01_template/*
+02_images/*
+03_output/*
+!*/.gitkeep
+insert_log.md
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+
+# OS / Office
+.DS_Store
+Thumbs.db
+~$*
