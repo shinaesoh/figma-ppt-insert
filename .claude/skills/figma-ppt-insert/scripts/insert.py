@@ -74,6 +74,10 @@ FONT_FAMILY = "Pretendard"
 
 TABLE_ID_LABEL = "화면ID"  # compared with whitespace removed, upper-cased
 MIN_SCREEN_AREA_SQIN = 1.0
+SIMILAR_RATIO_TOLERANCE = 0.15  # e.g. 16:9 vs 16:10 (11%) counts as similar
+PLACE_TOP = "상단 맞춤"
+PLACE_CENTER = "가운데"
+PLACE_FILL = "채우기"
 MIN_PPI = 150  # below this, screen text looks blurry when shown on the slide  # smaller pictures (logos, icons) are never screen targets
 PIC_NAME_PREFIX = "FIGMA:"
 REGION_TAG = "figma-ppt-insert region_in="
@@ -112,7 +116,7 @@ class ImageEntry:
 
 @dataclass
 class RunReport:
-    inserted: list[tuple[Target, ImageEntry]] = field(default_factory=list)
+    inserted: list[tuple[Target, ImageEntry, str]] = field(default_factory=list)
     missing_image: list[Target] = field(default_factory=list)
     kept_existing: list[Target] = field(default_factory=list)
     unused_images: list[ImageEntry] = field(default_factory=list)
@@ -295,14 +299,35 @@ def _image_size(path: Path) -> tuple[int, int]:
         return img.size
 
 
-def _effective_ppi(size: tuple[int, int], region: Box, mode: str) -> float:
+def _effective_ppi(size: tuple[int, int], region: Box, placement: str) -> float:
     """Pixels per inch of the image as shown on the slide (quality check only)."""
     per_width, per_height = size[0] / region.width, size[1] / region.height
-    # fit shows the whole image, so the tighter axis sets the scale; fill covers the box.
-    return max(per_width, per_height) if mode == MODE_FIT else min(per_width, per_height)
+    if placement == PLACE_TOP:
+        return per_width  # width always matches the region
+    # center shows the whole image (tighter axis sets the scale); fill covers the box.
+    return max(per_width, per_height) if placement == PLACE_CENTER else min(per_width, per_height)
 
 
-def _fit_box(region: Box, ratio: float) -> Box:
+def _is_similar_ratio(ratio: float, region: Box) -> bool:
+    return abs(ratio / (region.width / region.height) - 1) <= SIMILAR_RATIO_TOLERANCE
+
+
+def _top_box(region: Box, ratio: float) -> tuple[Box, float]:
+    """Match the region's width and top edge; return the box and bottom crop fraction.
+
+    Top-left and top-right corners coincide with the region, so callouts placed
+    on the previous screen keep their position. A slightly taller image is
+    cropped at the bottom instead of spilling out of the region.
+    """
+    height = region.width / ratio
+    crop_bottom = 0.0
+    if height > region.height:
+        crop_bottom = 1 - region.height / height
+        height = region.height
+    return Box(region.left, region.top, region.width, height), crop_bottom
+
+
+def _center_box(region: Box, ratio: float) -> Box:
     if ratio > region.width / region.height:
         width, height = region.width, region.width / ratio
     else:
@@ -325,15 +350,24 @@ def _apply_fill_crop(picture, region: Box, ratio: float) -> None:
         picture.crop_top = picture.crop_bottom = side
 
 
-def place_image(slide, target: Target, image: ImageEntry, mode: str) -> float:
+def place_image(slide, target: Target, image: ImageEntry, mode: str) -> tuple[str, float]:
     """Add the picture at the target's z-position and box, then remove the target.
 
-    Returns the effective resolution (ppi) of the placed image.
+    In fit mode a similar aspect ratio is top-aligned at full width; a clearly
+    different one (popup, mobile) is centered. Returns the placement used and
+    the effective resolution (ppi) of the placed image.
     """
     size = _image_size(image.path)
     ratio = size[0] / size[1]
     region = target.box
-    box = region if mode == MODE_FILL else _fit_box(region, ratio)
+    crop_bottom = 0.0
+    if mode == MODE_FILL:
+        placement, box = PLACE_FILL, region
+    elif _is_similar_ratio(ratio, region):
+        placement = PLACE_TOP
+        box, crop_bottom = _top_box(region, ratio)
+    else:
+        placement, box = PLACE_CENTER, _center_box(region, ratio)
     picture = slide.shapes.add_picture(
         str(image.path),
         Inches(box.left),
@@ -343,6 +377,8 @@ def place_image(slide, target: Target, image: ImageEntry, mode: str) -> float:
     )
     if mode == MODE_FILL:
         _apply_fill_crop(picture, region, ratio)
+    elif crop_bottom:
+        picture.crop_bottom = crop_bottom
     picture.name = f"{PIC_NAME_PREFIX}{target.screen_id}"
     picture._element.nvPicPr.cNvPr.set(
         "descr",
@@ -358,7 +394,7 @@ def place_image(slide, target: Target, image: ImageEntry, mode: str) -> float:
     for rid in set(old_rids):
         if not slide._element.xpath(f'.//@r:embed[. = "{rid}"]'):
             slide.part.rels.pop(rid)
-    return _effective_ppi(size, region, mode)
+    return placement, _effective_ppi(size, region, placement)
 
 
 def run_insert(prs, images: dict[str, ImageEntry], mode: str, report: RunReport) -> None:
@@ -372,7 +408,7 @@ def run_insert(prs, images: dict[str, ImageEntry], mode: str, report: RunReport)
             elif target.kind == "table":
                 report.kept_existing.append(target)
             continue
-        ppi = place_image(prs.slides[target.slide_no - 1], target, image, mode)
+        placement, ppi = place_image(prs.slides[target.slide_no - 1], target, image, mode)
         if ppi < MIN_PPI:
             width, height = _image_size(image.path)
             report.warnings.append(
@@ -380,7 +416,7 @@ def run_insert(prs, images: dict[str, ImageEntry], mode: str, report: RunReport)
                 f"({width}×{height}px, 표시 크기 기준 {ppi:.0f}ppi — {MIN_PPI}ppi 이상 권장). "
                 "피그마에서 배율 2x로 다시 export하세요."
             )
-        report.inserted.append((target, image))
+        report.inserted.append((target, image, placement))
         used.add(_key(target.screen_id))
     report.unused_images = [img for key, img in sorted(images.items()) if key not in used]
 
@@ -460,13 +496,13 @@ def format_report(
         lines.append(f"- 보관 개수 초과로 삭제: `{_rel(path, root)}`")
     lines += ["", f"### 삽입 성공 ({len(report.inserted)})", ""]
     if report.inserted:
-        lines += ["| 슬라이드 | 화면 ID | 사용 이미지 | 대상 |", "|---|---|---|---|"]
-        for target, image in report.inserted:
+        lines += ["| 슬라이드 | 화면 ID | 사용 이미지 | 대상 | 배치 |", "|---|---|---|---|---|"]
+        for target, image, placement in report.inserted:
             kind = {"marker": "마커", "picture": "삽입 이미지 교체", "table": "화면ID 표·기존 화면 교체"}[
                 target.kind
             ]
             lines.append(
-                f"| {target.slide_no} | {target.screen_id} | `{image.folder}/{image.path.name}` | {kind} |"
+                f"| {target.slide_no} | {target.screen_id} | `{image.folder}/{image.path.name}` | {kind} | {placement} |"
             )
     else:
         lines.append("- 없음")

@@ -5,7 +5,8 @@ description: |
   whose text is "[화면 교체 위치: {화면ID}]", or — on screen-definition decks without
   markers — replace the existing screenshot on slides whose table has a "화면ID" cell.
   Matching is by file name = Figma frame name = screen ID.
-  Fits each image into the marker box (keep ratio, centered; optional fill/crop),
+  Fits each image into the box (similar ratio: full width, top-aligned; very different
+  ratio such as popups: centered; optional fill/crop),
   removes the marker, archives the previous result, and appends a match report to
   insert_log.md. Re-running on an already-filled deck replaces the inserted screens
   in the same box. Triggers: "피그마 화면 넣어줘", "피그마 이미지 PPT에 삽입",
@@ -42,7 +43,8 @@ description: |
 | 우선순위 | 슬라이드마다 마커·이전 삽입 이미지 → 없을 때만 화면ID 표 |
 | 중복 ID | 같은 ID가 여러 슬라이드에 있으면 모두 같은 이미지로 교체 |
 | 최신 선택 | 같은 ID가 여러 날짜 폴더에 있으면 가장 최근 날짜 폴더. 같은 폴더에 png·jpg가 둘 다 있으면 png |
-| 배치 | 기본 `fit`: 비율 유지, 영역 안 가운데 정렬, 여백 허용. `--mode fill`: 영역을 채우고 가운데 기준으로 잘림 |
+| 배치 (기본 `fit`, 비율 유지) | 영역과 비율 차이 ±15% 이내(예: 16:9 ↔ 16:10)면 **상단 맞춤**: 영역 너비에 맞추고 좌상단·우상단을 영역과 일치시킴. 더 짧으면 아래 여백, 더 길면 아래쪽을 잘라 영역 안에 둠. 차이가 크면(팝업·모바일) **가운데**: 영역 안에 맞추고 가운데 정렬 |
+| 배치 (`--mode fill`) | 영역을 채우고 가운데 기준으로 잘림 |
 | z-순서 | 이미지는 마커가 있던 레이어 위치에 들어가고 마커는 삭제 |
 | 재실행 교체 | 삽입 이미지는 이름 `FIGMA:{화면ID}`, 대체 텍스트에 원래 영역(inch)을 기록. 마커가 없어도 이 이미지를 같은 영역에서 새 export로 교체 |
 | 단위 | 위치·크기 계산은 inch. 픽셀은 가로세로 비율과 해상도 점검에만 사용 |
