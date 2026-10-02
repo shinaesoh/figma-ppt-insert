@@ -73,7 +73,8 @@ MODE_FILL = "fill"
 FONT_FAMILY = "Pretendard"
 
 TABLE_ID_LABEL = "화면ID"  # compared with whitespace removed, upper-cased
-MIN_SCREEN_AREA_SQIN = 1.0  # smaller pictures (logos, icons) are never screen targets
+MIN_SCREEN_AREA_SQIN = 1.0
+MIN_PPI = 150  # below this, screen text looks blurry when shown on the slide  # smaller pictures (logos, icons) are never screen targets
 PIC_NAME_PREFIX = "FIGMA:"
 REGION_TAG = "figma-ppt-insert region_in="
 
@@ -289,10 +290,16 @@ def collect_images(images_root: Path, report: RunReport) -> dict[str, ImageEntry
     return latest
 
 
-def _image_ratio(path: Path) -> float:
+def _image_size(path: Path) -> tuple[int, int]:
     with Image.open(path) as img:
-        width, height = img.size
-    return width / height
+        return img.size
+
+
+def _effective_ppi(size: tuple[int, int], region: Box, mode: str) -> float:
+    """Pixels per inch of the image as shown on the slide (quality check only)."""
+    per_width, per_height = size[0] / region.width, size[1] / region.height
+    # fit shows the whole image, so the tighter axis sets the scale; fill covers the box.
+    return max(per_width, per_height) if mode == MODE_FIT else min(per_width, per_height)
 
 
 def _fit_box(region: Box, ratio: float) -> Box:
@@ -318,9 +325,13 @@ def _apply_fill_crop(picture, region: Box, ratio: float) -> None:
         picture.crop_top = picture.crop_bottom = side
 
 
-def place_image(slide, target: Target, image: ImageEntry, mode: str) -> None:
-    """Add the picture at the target's z-position and box, then remove the target."""
-    ratio = _image_ratio(image.path)
+def place_image(slide, target: Target, image: ImageEntry, mode: str) -> float:
+    """Add the picture at the target's z-position and box, then remove the target.
+
+    Returns the effective resolution (ppi) of the placed image.
+    """
+    size = _image_size(image.path)
+    ratio = size[0] / size[1]
     region = target.box
     box = region if mode == MODE_FILL else _fit_box(region, ratio)
     picture = slide.shapes.add_picture(
@@ -340,13 +351,14 @@ def place_image(slide, target: Target, image: ImageEntry, mode: str) -> None:
 
     old = target.element
     old.addprevious(picture._element)
-    old_rids = old.xpath(".//@r:embed") if target.kind == "picture" else []
+    old_rids = old.xpath(".//@r:embed")
     old.getparent().remove(old)
     # python-pptx's drop_rel() counts only r:id, not r:embed, so check usage here.
     # A re-added identical image is deduplicated onto the same rId and must survive.
     for rid in set(old_rids):
         if not slide._element.xpath(f'.//@r:embed[. = "{rid}"]'):
             slide.part.rels.pop(rid)
+    return _effective_ppi(size, region, mode)
 
 
 def run_insert(prs, images: dict[str, ImageEntry], mode: str, report: RunReport) -> None:
@@ -360,7 +372,14 @@ def run_insert(prs, images: dict[str, ImageEntry], mode: str, report: RunReport)
             elif target.kind == "table":
                 report.kept_existing.append(target)
             continue
-        place_image(prs.slides[target.slide_no - 1], target, image, mode)
+        ppi = place_image(prs.slides[target.slide_no - 1], target, image, mode)
+        if ppi < MIN_PPI:
+            width, height = _image_size(image.path)
+            report.warnings.append(
+                f"슬라이드 {target.slide_no}: `{image.path.name}` 해상도가 낮습니다 "
+                f"({width}×{height}px, 표시 크기 기준 {ppi:.0f}ppi — {MIN_PPI}ppi 이상 권장). "
+                "피그마에서 배율 2x로 다시 export하세요."
+            )
         report.inserted.append((target, image))
         used.add(_key(target.screen_id))
     report.unused_images = [img for key, img in sorted(images.items()) if key not in used]
