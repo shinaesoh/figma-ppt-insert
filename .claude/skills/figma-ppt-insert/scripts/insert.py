@@ -112,6 +112,7 @@ DESCRIPTION_PLACEHOLDER = (
     "화면명·화면타입·유형·화면 경로와 기능 설명을 입력하세요.",
 )
 SMALL_SCREEN_SHARE = 0.7  # target picture below this share of the median screen area is flagged
+HEADER_TAG_MAX_CHARS = 5  # header text this short ("1.9", "9/12") is a tag kept on new pages
 HEADER_ZONE = 0.15  # an ID-only text box above this share of the slide height names the screen
 FOOTER_ZONE = 0.9  # shapes below this share of the slide height are footer (page number)
 FRAME_MIN_SHARE = 0.4  # empty rectangle covering this share of the slide = content frame
@@ -707,8 +708,8 @@ def _apply_fill_crop(picture, region: Box, ratio: float) -> None:
 def place_image(slide, target: Target, image: ImageEntry, mode: str) -> tuple[str, float]:
     """Add the picture at the target's z-position and box, then remove the target.
 
-    In fit mode a similar aspect ratio is top-aligned at full width; a clearly
-    different one (popup, mobile) is centered. Returns the placement used and
+    In fit mode a similar or wider aspect ratio is top-aligned at full width; a
+    clearly narrower one (popup, mobile) is centered. Returns the placement used and
     the effective resolution (ppi) of the placed image.
     """
     size = _image_size(image.path)
@@ -717,7 +718,8 @@ def place_image(slide, target: Target, image: ImageEntry, mode: str) -> tuple[st
     crop_bottom = 0.0
     if mode == MODE_FILL:
         placement, box = PLACE_FILL, region
-    elif _is_similar_ratio(ratio, region):
+    elif _is_similar_ratio(ratio, region) or ratio > region.width / region.height:
+        # Wider than the box means a full screen, not a popup: keep it on top at full width.
         placement = PLACE_TOP
         box, crop_bottom = _top_box(region, ratio)
     else:
@@ -938,10 +940,11 @@ def _page_number_frames(slide, page_no: int, slide_height: float) -> list:
 
 
 def _screen_box(prs) -> Optional[Box]:
-    """Most common box of the existing screenshot across 화면ID slides."""
+    """Most common box of the existing screenshot across screen slides."""
     counts: dict[tuple, int] = {}
+    height = _emu_to_in(prs.slide_height)
     for slide in prs.slides:
-        picture = _largest_picture(slide) if _table_screen_id(slide) else None
+        picture = _largest_picture(slide) if _slide_screen_id(slide, height)[0] else None
         if picture is not None:
             box = _shape_box(picture)
             key = tuple(round(v, 2) for v in (box.left, box.top, box.width, box.height))
@@ -951,17 +954,27 @@ def _screen_box(prs) -> Optional[Box]:
     return Box(*max(counts, key=counts.get))
 
 
-def _is_skeleton(shape, page_no: int, slide_area: float, slide_height: float) -> bool:
-    """Shapes every screen page shares: tables, logos, page number, the content frame."""
-    if getattr(shape, "has_table", False) and shape.has_table:
-        return True
+def _is_skeleton(shape, page_no: int, slide_area: float, slide_height: float, screen: Box) -> bool:
+    """Shapes every screen page shares, judged by position rather than by deck.
+
+    Kept: tables outside the screen area (page header table, description table
+    beside the screen), small pictures (logos), text in the header band (page
+    title, screen ID, requirement ID), the footer page number and the empty
+    content frame. Anything drawn on the screen area belongs to that screen.
+    """
+    if shape.left is None or shape.width is None:
+        return False
     area = _emu_to_in(shape.width) * _emu_to_in(shape.height)
+    if getattr(shape, "has_table", False) and shape.has_table:
+        return not _inside(shape, screen)
     if shape.shape_type == MSO_SHAPE_TYPE.PICTURE:
-        return area < MIN_SCREEN_AREA_SQIN
+        return area < MIN_SCREEN_AREA_SQIN and not _inside(shape, screen)
     if shape.shape_type == MSO_SHAPE_TYPE.GROUP or not getattr(shape, "has_text_frame", False):
         return False
     text = shape.text_frame.text.strip()
     if text == str(page_no) and _in_footer(shape, slide_height):
+        return True
+    if text and _emu_to_in(shape.top) < slide_height * HEADER_ZONE and not _inside(shape, screen):
         return True
     return shape.shape_type == MSO_SHAPE_TYPE.AUTO_SHAPE and not text and area >= slide_area * FRAME_MIN_SHARE
 
@@ -1002,7 +1015,7 @@ def _clone_source_index(prs, screen_indexes: list[int], position: int) -> int:
     return min(pool, key=lambda i: (abs(i - (position - 0.5)), i))
 
 
-def _clone_screen_slide(prs, src, src_page: int, position: int):
+def _clone_screen_slide(prs, src, src_page: int, position: int, screen: Box):
     """Add a slide at 0-based ``position`` holding only the shared page skeleton of ``src``."""
     slide = prs.slides.add_slide(src.slide_layout)
     tree = slide.shapes._spTree
@@ -1014,7 +1027,7 @@ def _clone_screen_slide(prs, src, src_page: int, position: int):
     slide_height = _emu_to_in(prs.slide_height)
     slide_area = _emu_to_in(prs.slide_width) * slide_height
     for shape in src.shapes:
-        if _is_skeleton(shape, src_page, slide_area, slide_height):
+        if _is_skeleton(shape, src_page, slide_area, slide_height, screen):
             element = copy.deepcopy(shape._element)
             _copy_rels(element, src.part, slide.part)
             tree.append(element)
@@ -1025,18 +1038,64 @@ def _clone_screen_slide(prs, src, src_page: int, position: int):
     return slide
 
 
+def _fill_header_texts(slide, screen_id: str, slide_height: float) -> None:
+    """Header-text decks: new ID in the ID box, placeholders for page-specific header text.
+
+    Short tags (version "1.9", progress "9/12") are left as they are.
+    """
+    header = [
+        shape for shape in slide.shapes
+        if getattr(shape, "has_text_frame", False)
+        and shape.text_frame.text.strip()
+        and _emu_to_in(shape.top) < slide_height * HEADER_ZONE
+    ]
+    ids = [s for s in header if _ID_TEXT_RE.fullmatch(s.text_frame.text.strip())]
+    id_box = min(ids, key=lambda s: s.left) if ids else None
+    for shape in header:
+        if shape is id_box:
+            _set_text(shape.text_frame, screen_id)
+        elif len(shape.text_frame.text.strip()) > HEADER_TAG_MAX_CHARS:
+            _set_text(shape.text_frame, PLACEHOLDER)
+
+
+def _reset_side_tables(slide, screen: Box) -> bool:
+    """Description tables right of the screen: keep one row, first cell "1", rest placeholder."""
+    found = False
+    for shape in slide.shapes:
+        if not (getattr(shape, "has_table", False) and shape.has_table):
+            continue
+        if _emu_to_in(shape.left) < screen.left + screen.width - OVERLAY_MARGIN_IN:
+            continue
+        found = True
+        for extra in shape.table._tbl.tr_lst[1:]:
+            extra.getparent().remove(extra)
+        cells = list(shape.table.rows[0].cells)
+        for idx, cell in enumerate(cells):
+            _set_text(cell.text_frame, "1" if idx == 0 and len(cells) > 1 else PLACEHOLDER)
+        shape.height = shape.table.rows[0].height
+    return found
+
+
 def _fill_new_slide(slide, screen_id: str, page_no: int, src_page: int, screen: Box, prs) -> None:
+    slide_height = _emu_to_in(prs.slide_height)
     table = _id_table(slide)
-    for row in table.rows:
-        cells = list(row.cells)
-        for idx, cell in enumerate(cells[:-1]):
-            label = _label(cell.text)
-            if label == TABLE_ID_LABEL:
-                _set_text(cells[idx + 1].text_frame, screen_id)
-            elif label in UNKNOWN_FIELD_LABELS:
-                _set_text(cells[idx + 1].text_frame, PLACEHOLDER)
-    for frame in _page_number_frames(slide, src_page, _emu_to_in(prs.slide_height)):
+    if table is not None:
+        for row in table.rows:
+            cells = list(row.cells)
+            for idx, cell in enumerate(cells[:-1]):
+                label = _label(cell.text)
+                if label == TABLE_ID_LABEL:
+                    _set_text(cells[idx + 1].text_frame, screen_id)
+                elif label in UNKNOWN_FIELD_LABELS:
+                    _set_text(cells[idx + 1].text_frame, PLACEHOLDER)
+    else:
+        _fill_header_texts(slide, screen_id, slide_height)
+    for frame in _page_number_frames(slide, src_page, slide_height):
         _set_text(frame, str(page_no))
+
+    if _reset_side_tables(slide, screen):
+        _add_marker(slide, screen, screen_id)
+        return
 
     frame_right = _emu_to_in(prs.slide_width) - 0.3
     for shape in slide.shapes:
@@ -1055,6 +1114,10 @@ def _fill_new_slide(slide, screen_id: str, page_no: int, src_page: int, screen: 
             run.font.name = FONT_FAMILY
             run.font.size = Pt(10)
 
+    _add_marker(slide, screen, screen_id)
+
+
+def _add_marker(slide, screen: Box, screen_id: str) -> None:
     marker = slide.shapes.add_textbox(
         Inches(screen.left), Inches(screen.top), Inches(screen.width), Inches(screen.height)
     )
@@ -1064,7 +1127,7 @@ def _fill_new_slide(slide, screen_id: str, page_no: int, src_page: int, screen: 
 def add_missing_slides(prs, images: dict[str, ImageEntry], report: RunReport) -> list[str]:
     """Create a screen page for each image whose ID has no slide yet.
 
-    The new page clones the shared skeleton of the neighboring 화면ID slide,
+    The new page clones the shared skeleton of the neighboring screen slide,
     placed in natural ID order, and carries a marker for the regular insert
     pass. Page numbers of later slides are shifted to match.
     """
@@ -1080,7 +1143,7 @@ def add_missing_slides(prs, images: dict[str, ImageEntry], report: RunReport) ->
     screen = _screen_box(prs)
     if screen is None:
         report.warnings.append(
-            "화면ID 표가 있는 슬라이드가 없어 새 슬라이드를 만들지 않았습니다 "
+            "화면 ID가 있는 화면 슬라이드가 없어 새 슬라이드를 만들지 않았습니다 "
             f"({', '.join(new_ids)})."
         )
         return []
@@ -1092,14 +1155,15 @@ def add_missing_slides(prs, images: dict[str, ImageEntry], report: RunReport) ->
     }
     added: list[str] = []
     for screen_id in new_ids:
-        screens = [(i, _table_screen_id(s)) for i, s in enumerate(prs.slides) if _table_screen_id(s)]
+        ids = [(i, _slide_screen_id(s, slide_height)[0]) for i, s in enumerate(prs.slides)]
+        screens = [(i, sid) for i, sid in ids if sid]
         before = [i for i, sid in screens if _natural_key(sid) < _natural_key(screen_id)]
         neighbor = before[-1] if before else screens[0][0]
         position = neighbor + 1 if before else neighbor
         src_index = _clone_source_index(prs, [i for i, _ in screens], position)
         src = prs.slides[src_index]
         src_page = src_index + 1  # page numbers are checked against the slide position
-        slide = _clone_screen_slide(prs, src, src_page, position)
+        slide = _clone_screen_slide(prs, src, src_page, position, screen)
         _fill_new_slide(slide, screen_id, position + 1, src_page, screen, prs)
         added.append(screen_id)
 
@@ -1236,7 +1300,7 @@ def format_report(
         new_pages = [t for t, _, _ in report.inserted if _key(t.screen_id) in {_key(a) for a in added}]
         lines += ["", f"### 새 슬라이드 추가 ({len(added)})", ""]
         lines += [
-            f"- 슬라이드 {t.slide_no}: `{t.screen_id}` — 화면명·화면타입·유형·화면 경로·설명 {PLACEHOLDER}"
+            f"- 슬라이드 {t.slide_no}: `{t.screen_id}` — `{PLACEHOLDER}`로 표시된 항목(화면명·경로·설명 등)을 채워 주세요"
             for t in new_pages
         ]
     lines += ["", f"### 매칭 실패 — 마커는 있는데 이미지 없음 ({len(report.missing_image)})", ""]
@@ -1346,7 +1410,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--add-slides",
         action="store_true",
-        help="add a screen page (cloned layout) for images whose ID has no slide yet",
+        help="(default, kept for compatibility) add a screen page for new IDs",
+    )
+    parser.add_argument(
+        "--no-add-slides",
+        action="store_true",
+        help="do not add pages for new IDs; report those images as unmatched",
     )
     parser.add_argument(
         "--downloads",
@@ -1409,7 +1478,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         images = organize_images(
             root / IMAGES_DIR, downloads, report, dry_run=args.dry_run, scratch=Path(scratch)
         )
-        added = add_missing_slides(prs, images, report) if args.add_slides else []
+        added = [] if args.no_add_slides else add_missing_slides(prs, images, report)
         run_insert(prs, images, args.mode, report, args.overlay)
 
     final_path: Optional[Path] = None
