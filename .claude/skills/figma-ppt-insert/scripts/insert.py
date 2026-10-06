@@ -16,15 +16,17 @@ unitless aspect ratio.
 
 Project layout (one folder per project under <repo>/projects/):
     projects/{project}/01_template/                one source .pptx
-    projects/{project}/02_images/YYYY-MM-DD/       exports per date; newest folder wins per ID
+    projects/{project}/02_images/{ID}.png          one current image per screen ID
+    projects/{project}/02_images/_archive/         replaced images ({ID}_{YYYYMMDD_HHMM}.png)
     projects/{project}/03_output/{name}_최종.pptx  latest result
     projects/{project}/03_output/_archive/         previous results (newest 10 kept)
     projects/{project}/insert_log.md               cumulative run log
 
 Before matching, exports downloaded today (names shaped like the deck's screen
-IDs, or Figma zip exports of them) are moved from ~/Downloads into
-02_images/{download date}/; matching files from the two days before are only
-reported.
+IDs, or Figma zip exports of them) are moved from ~/Downloads into 02_images/;
+the image each one replaces goes to 02_images/_archive/. Matching files from the
+two days before are only reported. Date folders from the earlier layout
+(02_images/YYYY-MM-DD/) are folded in the same way.
 
 Usage:
     python3 .claude/skills/figma-ppt-insert/scripts/insert.py [options]
@@ -47,6 +49,7 @@ import copy
 import re
 import shutil
 import sys
+import tempfile
 import zipfile
 from dataclasses import dataclass, field
 from datetime import date, datetime
@@ -76,7 +79,7 @@ ARCHIVE_DIR = "_archive"
 LOG_FILE = "insert_log.md"
 OUTPUT_SUFFIX = "_최종"
 ARCHIVE_KEEP = 10
-IMAGE_EXTS = (".png", ".jpg", ".jpeg")  # earlier = preferred on a same-folder tie
+IMAGE_EXTS = (".png", ".jpg", ".jpeg")  # earlier = preferred on a same-time tie
 IMAGE_FORMATS = {"PNG", "JPEG"}  # actual content, checked with Pillow
 IGNORED_FILES = {".gitkeep", "thumbs.db", "desktop.ini", ".ds_store"}
 MODE_FIT = "fit"
@@ -106,12 +109,12 @@ FRAME_MIN_SHARE = 0.4  # empty rectangle covering this share of the slide = cont
 DOWNLOADS_DIR = Path.home() / "Downloads"
 DOWNLOAD_DAYS = 1  # import exports downloaded today (1) or within the last N days
 NOTICE_DAYS = 2  # older downloads within this many extra days are only reported
-ZIP_DIR = "_zip"  # imported Figma zip exports are kept here inside the date folder
+IMAGE_ARCHIVE_DIR = "_archive"  # replaced images and imported zip exports
 PIC_NAME_PREFIX = "FIGMA:"
 REGION_TAG = "figma-ppt-insert region_in="
 
 _MARKER_RE = re.compile(r"\[\s*화면\s*교체\s*위치\s*[:：]\s*(?P<id>[^\]\s]+)\s*\]")
-_DATE_DIR_RE = re.compile(r"\d{4}-\d{2}-\d{2}")
+_DATE_DIR_RE = re.compile(r"\d{4}-\d{2}-\d{2}")  # legacy date-folder layout
 _SCALE_SUFFIX_RE = re.compile(r"@\d+(?:\.\d+)?x$", re.IGNORECASE)
 _COPY_SUFFIX_RE = re.compile(r"\s*\(\d+\)$")  # browser duplicate: "UI-IMS-2001 (1).png"
 _TRAILING_DIGITS_RE = re.compile(r"\d+$")
@@ -144,7 +147,7 @@ class Target:
 class ImageEntry:
     screen_id: str
     path: Path
-    folder: str
+    label: str  # file name inside 02_images/
 
 
 @dataclass
@@ -154,6 +157,8 @@ class RunReport:
     kept_existing: list[Target] = field(default_factory=list)
     unused_images: list[ImageEntry] = field(default_factory=list)
     imported: list[tuple[str, str]] = field(default_factory=list)  # (download name, dest)
+    moved: list[tuple[str, str]] = field(default_factory=list)  # (old place, new name) in 02_images
+    archived: list[tuple[str, str]] = field(default_factory=list)  # (old place, archive name)
     recent_downloads: list[tuple[str, date]] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
 
@@ -302,57 +307,10 @@ def _unsupported_reason(path: Path) -> Optional[str]:
     return None
 
 
-def collect_images(images_root: Path, report: RunReport) -> dict[str, ImageEntry]:
-    """Return the newest image per screen ID across YYYY-MM-DD folders."""
-    dated: list[tuple[date, Path]] = []
-    if images_root.is_dir():
-        for folder in images_root.iterdir():
-            if not folder.is_dir():
-                continue
-            try:
-                if not _DATE_DIR_RE.fullmatch(folder.name):
-                    raise ValueError
-                dated.append((date.fromisoformat(folder.name), folder))
-            except ValueError:
-                report.warnings.append(
-                    f"`{IMAGES_DIR}/{folder.name}` 폴더는 날짜 형식(YYYY-MM-DD)이 아니라 건너뜁니다."
-                )
-        for loose in images_root.iterdir():
-            if loose.is_file() and not _is_ignorable(loose):
-                report.warnings.append(
-                    f"`{IMAGES_DIR}/{loose.name}` 은 날짜 폴더 밖에 있어 건너뜁니다."
-                )
-
-    latest: dict[str, ImageEntry] = {}
-    for _, folder in sorted(dated):  # oldest first; newer folders overwrite
-        in_folder: dict[str, ImageEntry] = {}
-        for path in sorted(folder.iterdir()):
-            if not path.is_file() or _is_ignorable(path):
-                continue
-            reason = _unsupported_reason(path)
-            if reason:
-                report.warnings.append(
-                    f"`{folder.name}/{path.name}` 건너뜀 — {reason}. "
-                    "피그마에서 PNG(또는 JPG)로 다시 export하세요."
-                )
-                continue
-            screen_id = _SCALE_SUFFIX_RE.sub("", path.stem).strip()
-            key = _key(screen_id)
-            current = in_folder.get(key)
-            if current:
-                keep, drop = sorted(
-                    (current, ImageEntry(screen_id, path, folder.name)),
-                    key=lambda e: IMAGE_EXTS.index(e.path.suffix.lower()),
-                )
-                report.warnings.append(
-                    f"`{folder.name}` 폴더에 `{screen_id}` 파일이 여러 개 — "
-                    f"`{keep.path.name}` 사용, `{drop.path.name}` 무시."
-                )
-                in_folder[key] = keep
-            else:
-                in_folder[key] = ImageEntry(screen_id, path, folder.name)
-        latest.update(in_folder)
-    return latest
+def _clean_stem(file_name: str) -> str:
+    """Screen ID from a file name: drop ``@2x`` scale and browser `` (1)`` copy suffixes."""
+    stem = _COPY_SUFFIX_RE.sub("", Path(file_name).stem)
+    return _SCALE_SUFFIX_RE.sub("", stem).strip()
 
 
 def deck_screen_ids(prs) -> set[str]:
@@ -377,8 +335,7 @@ class _IdMatcher:
         self.prefixes.discard("")
 
     def screen_id(self, file_name: str) -> Optional[str]:
-        stem = _COPY_SUFFIX_RE.sub("", Path(file_name).stem)
-        stem = _SCALE_SUFFIX_RE.sub("", stem).strip()
+        stem = _clean_stem(file_name)
         key = _key(stem)
         if key in self.known:
             return stem
@@ -416,29 +373,49 @@ def _zip_members(path: Path, matcher: _IdMatcher) -> list[tuple[str, str]]:
     return found
 
 
-def import_downloads(
-    downloads: Path,
-    images_root: Path,
-    matcher: _IdMatcher,
-    report: RunReport,
-    *,
-    days: int,
-    dry_run: bool,
-) -> None:
-    """Move recent Figma exports from Downloads into 02_images/{download date}/.
+@dataclass
+class _Candidate:
+    """One available export of a screen, wherever it currently lives."""
 
-    Images (and zip exports holding images) whose name looks like a screen ID
-    and that were downloaded within ``days`` days are moved; the newest file
-    wins per ID. Matching files from the ``NOTICE_DAYS`` days before that are
-    only listed in the report so the user can decide.
-    """
+    screen_id: str
+    stamp: float  # export / download time
+    path: Path  # the file itself, or the zip holding it
+    member: Optional[str]  # zip member name
+    origin: str  # ORIGIN_*
+
+    @property
+    def ext(self) -> str:
+        return Path(self.member or self.path.name).suffix.lower()
+
+    @property
+    def name(self) -> str:
+        return f"{self.path.name} → {Path(self.member).name}" if self.member else self.path.name
+
+
+ORIGIN_CURRENT = "current"  # 02_images/{ID}.png, already in place
+ORIGIN_LOOSE = "loose"  # 02_images/ file with a suffix to clean (@2x, (1))
+ORIGIN_LEGACY = "legacy"  # 02_images/YYYY-MM-DD/ from the earlier date-folder layout
+ORIGIN_DOWNLOAD = "download"
+
+
+def _rank(candidate: _Candidate) -> tuple:
+    # Newest wins; on a tie keep the file already in place, then prefer png.
+    return (
+        candidate.stamp,
+        candidate.origin == ORIGIN_CURRENT,
+        -IMAGE_EXTS.index(candidate.ext),
+    )
+
+
+def _scan_downloads(
+    downloads: Path, matcher: _IdMatcher, report: RunReport, days: int
+) -> list[_Candidate]:
+    """Exports downloaded within ``days`` days; older matches within NOTICE_DAYS are reported."""
     if not downloads.is_dir():
         report.warnings.append(f"다운로드 폴더를 찾을 수 없어 가져오지 않았습니다: `{downloads}`")
-        return
+        return []
     today = date.today()
-    # screen key -> (download time, file, zip member or None, screen ID)
-    newest: dict[str, tuple[float, Path, Optional[str], str]] = {}
-    candidates: set[Path] = set()
+    found: list[_Candidate] = []
     for path in sorted(downloads.iterdir()):
         if not path.is_file() or _is_ignorable(path):
             continue
@@ -447,7 +424,7 @@ def import_downloads(
             entries = _zip_members(path, matcher)
         elif ext in IMAGE_EXTS:
             sid = matcher.screen_id(path.name)
-            entries = [(None, sid)] if sid else []
+            entries = [(None, sid)] if sid and not _unsupported_reason(path) else []
         else:
             continue
         if not entries:
@@ -458,47 +435,136 @@ def import_downloads(
             if age < days + NOTICE_DAYS:
                 report.recent_downloads.append((path.name, day))
             continue
-        candidates.add(path)
         stamp = _download_time(path)
-        for member, sid in entries:
-            key = _key(sid)
-            if key not in newest or stamp > newest[key][0]:
-                newest[key] = (stamp, path, member, sid)
+        found += [_Candidate(sid, stamp, path, member, ORIGIN_DOWNLOAD) for member, sid in entries]
+    return found
 
-    used: set[Path] = set()
-    for stamp, path, member, sid in sorted(newest.values(), key=lambda v: _natural_key(v[3])):
-        ext = Path(member or path.name).suffix.lower()
-        day = _download_date(path)
-        dest = images_root / day.isoformat() / f"{sid}{ext}"
-        if any(
-            f.stat().st_mtime >= stamp
-            for f in (dest.with_suffix(e) for e in IMAGE_EXTS)
-            if f.is_file()
-        ):
-            continue  # an equal or newer export of this ID is already in the project
-        source = f"{path.name} → {Path(member).name}" if member else path.name
-        report.imported.append((source, f"{IMAGES_DIR}/{day.isoformat()}/{dest.name}"))
-        used.add(path)
-        if dry_run:
+
+def _scan_project(images_root: Path, report: RunReport) -> tuple[list[_Candidate], list[Path]]:
+    """Images already in 02_images (flat or legacy date folders) and legacy folders seen."""
+    found: list[_Candidate] = []
+    legacy_dirs: list[Path] = []
+    if not images_root.is_dir():
+        return found, legacy_dirs
+
+    def add(path: Path, origin: str, where: str) -> None:
+        reason = _unsupported_reason(path)
+        if reason:
+            report.warnings.append(
+                f"`{where}{path.name}` 건너뜀 — {reason}. 피그마에서 PNG(또는 JPG)로 다시 export하세요."
+            )
+            return
+        sid = _clean_stem(path.name)
+        if origin == ORIGIN_CURRENT and path.name != f"{sid}{path.suffix}":
+            origin = ORIGIN_LOOSE
+        found.append(_Candidate(sid, path.stat().st_mtime, path, None, origin))
+
+    for entry in sorted(images_root.iterdir()):
+        if entry.is_file():
+            if not _is_ignorable(entry):
+                add(entry, ORIGIN_CURRENT, "")
+        elif entry.name == IMAGE_ARCHIVE_DIR:
             continue
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        if member:
-            with zipfile.ZipFile(path) as archive:
-                dest.write_bytes(archive.read(member))
+        elif _DATE_DIR_RE.fullmatch(entry.name):
+            legacy_dirs.append(entry)
+            for path in sorted(entry.iterdir()):
+                if path.is_file() and not _is_ignorable(path):
+                    add(path, ORIGIN_LEGACY, f"{entry.name}/")
         else:
-            dest.unlink(missing_ok=True)  # a same-day re-export replaces the earlier one
-            shutil.move(str(path), str(dest))
+            report.warnings.append(f"`{IMAGES_DIR}/{entry.name}` 폴더는 사용하지 않아 건너뜁니다.")
+    return found, legacy_dirs
 
-    for path in sorted(candidates - used):
+
+def _archive_name(archive_dir: Path, candidate: _Candidate) -> Path:
+    stamp = datetime.fromtimestamp(candidate.stamp).strftime("%Y%m%d_%H%M")
+    return _unique_path(archive_dir / f"{candidate.screen_id}_{stamp}{candidate.ext}")
+
+
+def organize_images(
+    images_root: Path,
+    downloads: list[_Candidate],
+    report: RunReport,
+    *,
+    dry_run: bool,
+    scratch: Path,
+) -> dict[str, ImageEntry]:
+    """Keep exactly one current image per screen ID in 02_images/; archive the rest.
+
+    The newest export of each ID (from Downloads, a leftover date folder, or the
+    folder itself) becomes ``02_images/{ID}.{ext}``; the image it replaces moves
+    to ``02_images/_archive/{ID}_{YYYYMMDD_HHMM}.{ext}``. Losing downloads stay in
+    Downloads. In a dry run nothing moves; zip members are unpacked to ``scratch``.
+    """
+    project, legacy_dirs = _scan_project(images_root, report)
+    by_key: dict[str, list[_Candidate]] = {}
+    for candidate in project + downloads:
+        by_key.setdefault(_key(candidate.screen_id), []).append(candidate)
+
+    archive_dir = images_root / IMAGE_ARCHIVE_DIR
+    images: dict[str, ImageEntry] = {}
+    used_zips: set[Path] = set()
+    for key in sorted(by_key, key=_natural_key):
+        group = sorted(by_key[key], key=_rank, reverse=True)
+        winner, losers = group[0], group[1:]
+        dest = images_root / f"{winner.screen_id}{winner.ext}"
+
+        for loser in losers:
+            if loser.origin == ORIGIN_DOWNLOAD:
+                report.warnings.append(
+                    f"다운로드의 `{loser.name}`은 같은 화면 ID의 더 최근 이미지가 있어 가져오지 않았습니다."
+                )
+                continue
+            target = _archive_name(archive_dir, loser)
+            report.archived.append((_display(loser, images_root), target.name))
+            if not dry_run:
+                archive_dir.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(loser.path), str(target))
+
+        if winner.origin == ORIGIN_DOWNLOAD:
+            report.imported.append((winner.name, f"{IMAGES_DIR}/{dest.name}"))
+        elif winner.origin != ORIGIN_CURRENT:
+            report.moved.append((_display(winner, images_root), dest.name))
+
+        source = winner.path
+        if winner.origin != ORIGIN_CURRENT:
+            if winner.member:
+                used_zips.add(winner.path)
+                out = dest if not dry_run else scratch / dest.name
+                with zipfile.ZipFile(winner.path) as archive:
+                    out.write_bytes(archive.read(winner.member))
+                source = out
+            elif not dry_run:
+                shutil.move(str(winner.path), str(dest))
+                source = dest
+        elif not dry_run:
+            source = dest
+        images[key] = ImageEntry(winner.screen_id, source, dest.name)
+
+    if not dry_run:
+        for zip_path in sorted(used_zips):
+            archive_dir.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(zip_path), str(_unique_path(archive_dir / zip_path.name)))
+        for folder in legacy_dirs:
+            for leftover in folder.rglob("*"):
+                if leftover.is_file() and not _is_ignorable(leftover):
+                    archive_dir.mkdir(parents=True, exist_ok=True)
+                    shutil.move(str(leftover), str(_unique_path(archive_dir / leftover.name)))
+            shutil.rmtree(folder, ignore_errors=True)
+    if legacy_dirs:
+        names = ", ".join(f.name for f in legacy_dirs)
+        done = "정리할 예정입니다" if dry_run else "정리했습니다"
         report.warnings.append(
-            f"다운로드의 `{path.name}`은 같은 화면 ID의 더 최근 파일이 있어 가져오지 않았습니다."
+            f"날짜 폴더({names})를 {done} — 화면별 최신 이미지는 `{IMAGES_DIR}/`에, "
+            f"이전 이미지는 `{IMAGES_DIR}/{IMAGE_ARCHIVE_DIR}/`에 있습니다."
         )
-    if dry_run:
-        return
-    for path in sorted(p for p in used if p.suffix.lower() == ".zip"):
-        zip_dir = images_root / _download_date(path).isoformat() / ZIP_DIR
-        zip_dir.mkdir(parents=True, exist_ok=True)
-        shutil.move(str(path), str(_unique_path(zip_dir / path.name)))
+    return images
+
+
+def _display(candidate: _Candidate, images_root: Path) -> str:
+    try:
+        return candidate.path.relative_to(images_root).as_posix()
+    except ValueError:
+        return candidate.name
 
 
 def _image_size(path: Path) -> tuple[int, int]:
@@ -936,13 +1002,19 @@ def format_report(
         lines.append(f"- 이전 최종본 보관: `{_rel(archived, root)}`")
     for path in pruned:
         lines.append(f"- 보관 개수 초과로 삭제: `{_rel(path, root)}`")
-    imported_title = "다운로드에서 가져옴" if final_path else "다운로드에서 가져올 예정 (미리보기 — 옮기지 않음, 아래 매칭에 미반영)"
+    imported_title = "다운로드에서 가져옴" if final_path else "다운로드에서 가져올 예정 (미리보기 — 옮기지 않음)"
     lines += ["", f"### {imported_title} ({len(report.imported)})", ""]
     lines += [f"- `{src}` → `{dest}`" for src, dest in report.imported] or ["- 없음"]
     if report.recent_downloads:
         lines += ["", f"### 다운로드 — 최근 파일, 가져오지 않음 ({len(report.recent_downloads)})", ""]
         lines += [f"- `{name}` ({day:%m-%d})" for name, day in report.recent_downloads]
         lines.append("- 넣으려면 `--download-days 3`으로 다시 실행하세요.")
+    if report.moved:
+        lines += ["", f"### 이미지 폴더 정리 ({len(report.moved)})", ""]
+        lines += [f"- `{old}` → `{IMAGES_DIR}/{new}`" for old, new in report.moved]
+    if report.archived:
+        lines += ["", f"### 이전 이미지 보관 ({len(report.archived)})", ""]
+        lines += [f"- `{old}` → `{IMAGES_DIR}/{IMAGE_ARCHIVE_DIR}/{new}`" for old, new in report.archived]
     lines += ["", f"### 삽입 성공 ({len(report.inserted)})", ""]
     if report.inserted:
         lines += ["| 슬라이드 | 화면 ID | 사용 이미지 | 대상 | 배치 |", "|---|---|---|---|---|"]
@@ -951,7 +1023,7 @@ def format_report(
                 target.kind
             ]
             lines.append(
-                f"| {target.slide_no} | {target.screen_id} | `{image.folder}/{image.path.name}` | {kind} | {placement} |"
+                f"| {target.slide_no} | {target.screen_id} | `{image.label}` | {kind} | {placement} |"
             )
     else:
         lines.append("- 없음")
@@ -967,7 +1039,7 @@ def format_report(
     lines += ["", f"### 이미지 없음 — 화면ID 슬라이드, 기존 화면 유지 ({len(report.kept_existing)})", ""]
     lines += [f"- 슬라이드 {t.slide_no}: `{t.screen_id}`" for t in report.kept_existing] or ["- 없음"]
     lines += ["", f"### 매칭 실패 — 이미지는 있는데 마커·화면ID 없음 ({len(report.unused_images)})", ""]
-    lines += [f"- `{i.folder}/{i.path.name}`" for i in report.unused_images] or ["- 없음"]
+    lines += [f"- `{IMAGES_DIR}/{i.label}`" for i in report.unused_images] or ["- 없음"]
     if report.warnings:
         lines += ["", f"### 확인 필요 ({len(report.warnings)})", ""]
         lines += [f"- {w}" for w in report.warnings]
@@ -1102,7 +1174,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             print(
                 f"`projects/{root.name}` 프로젝트를 만들었습니다.\n"
                 f"- 원본 PPT 1개 → projects/{root.name}/{TEMPLATE_DIR}/\n"
-                f"- 피그마 이미지 → projects/{root.name}/{IMAGES_DIR}/YYYY-MM-DD/"
+                f"- 피그마 이미지 → projects/{root.name}/{IMAGES_DIR}/ (다운로드에서 자동으로 가져옴)"
             )
             return 0
         root = args.root.resolve() if args.root else resolve_project(args.project)
@@ -1114,18 +1186,19 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     report = RunReport()
     prs = Presentation(str(template))
-    if not args.no_downloads:
-        import_downloads(
-            args.downloads,
-            root / IMAGES_DIR,
-            _IdMatcher(deck_screen_ids(prs)),
-            report,
-            days=max(args.download_days, 1),
-            dry_run=args.dry_run,
+    downloads = (
+        []
+        if args.no_downloads
+        else _scan_downloads(
+            args.downloads, _IdMatcher(deck_screen_ids(prs)), report, max(args.download_days, 1)
         )
-    images = collect_images(root / IMAGES_DIR, report)
-    added = add_missing_slides(prs, images, report) if args.add_slides else []
-    run_insert(prs, images, args.mode, report)
+    )
+    with tempfile.TemporaryDirectory() as scratch:  # dry-run copies of zip members
+        images = organize_images(
+            root / IMAGES_DIR, downloads, report, dry_run=args.dry_run, scratch=Path(scratch)
+        )
+        added = add_missing_slides(prs, images, report) if args.add_slides else []
+        run_insert(prs, images, args.mode, report)
 
     final_path: Optional[Path] = None
     archived: Optional[Path] = None
