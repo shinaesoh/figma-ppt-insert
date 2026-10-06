@@ -39,7 +39,6 @@ from __future__ import annotations
 import argparse
 import copy
 import re
-import shutil
 import sys
 from dataclasses import dataclass, field
 from datetime import date, datetime
@@ -728,7 +727,13 @@ def save_with_archive(prs, template: Path, output_dir: Path) -> tuple[Path, Opti
         archive_dir.mkdir(exist_ok=True)
         stamp = datetime.fromtimestamp(final_path.stat().st_mtime).strftime("%Y%m%d_%H%M")
         archived = _unique_path(archive_dir / f"{template.stem}_{stamp}.pptx")
-        shutil.move(str(final_path), str(archived))
+        # Same-volume rename: fails cleanly if PowerPoint holds the file, unlike
+        # shutil.move's copy+delete fallback that leaves a stray archive copy.
+        try:
+            final_path.rename(archived)
+        except PermissionError:
+            tmp_path.unlink(missing_ok=True)
+            raise
         old = sorted(archive_dir.glob("*.pptx"), key=lambda p: p.stat().st_mtime, reverse=True)
         for path in old[ARCHIVE_KEEP:]:
             path.unlink()
