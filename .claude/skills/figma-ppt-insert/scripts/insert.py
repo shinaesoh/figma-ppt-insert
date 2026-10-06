@@ -87,6 +87,8 @@ MIN_PPI = 150  # below this, screen text looks blurry when shown on the slide
 PAGE_LABEL = "페이지"
 UNKNOWN_FIELD_LABELS = {"화면명", "화면타입", "유형", "화면경로"}  # left as placeholders on new pages
 PLACEHOLDER = "(확인 필요)"
+TYPE_LABEL = "유형"
+CLONE_TYPE_VALUE = "변경"  # new pages copy the frame of the nearest slide with this 유형
 DESCRIPTION_PLACEHOLDER = (
     "[확인 필요] 화면 설명",
     "피그마 export로 추가된 신규 화면입니다.",
@@ -563,6 +565,28 @@ def _copy_rels(element, src_part, dst_part) -> None:
             node.set(attr, new_rid)
 
 
+def _type_value(slide) -> str:
+    table = _id_table(slide)
+    if table is None:
+        return ""
+    for row in table.rows:
+        cells = list(row.cells)
+        for idx, cell in enumerate(cells[:-1]):
+            if _label(cell.text) == TYPE_LABEL:
+                return cells[idx + 1].text.strip()
+    return ""
+
+
+def _clone_source_index(prs, screen_indexes: list[int], position: int) -> int:
+    """Screen slide nearest to ``position`` whose 유형 is "변경"; the neighbor if none.
+
+    Pages marked 유지 use a gray frame in these decks, which a new screen must not inherit.
+    """
+    changed = [i for i in screen_indexes if _type_value(prs.slides[i]) == CLONE_TYPE_VALUE]
+    pool = changed or screen_indexes
+    return min(pool, key=lambda i: (abs(i - (position - 0.5)), i))
+
+
 def _clone_screen_slide(prs, src, src_page: int, position: int):
     """Add a slide at 0-based ``position`` holding only the shared page skeleton of ``src``."""
     slide = prs.slides.add_slide(src.slide_layout)
@@ -652,8 +676,9 @@ def add_missing_slides(prs, images: dict[str, ImageEntry], report: RunReport) ->
     for screen_id in new_ids:
         screens = [(i, _table_screen_id(s)) for i, s in enumerate(prs.slides) if _table_screen_id(s)]
         before = [i for i, sid in screens if _natural_key(sid) < _natural_key(screen_id)]
-        src_index = before[-1] if before else screens[0][0]
-        position = src_index + 1 if before else src_index
+        neighbor = before[-1] if before else screens[0][0]
+        position = neighbor + 1 if before else neighbor
+        src_index = _clone_source_index(prs, [i for i, _ in screens], position)
         src = prs.slides[src_index]
         src_page = src_index + 1  # page numbers are checked against the slide position
         slide = _clone_screen_slide(prs, src, src_page, position)
