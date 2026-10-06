@@ -3,7 +3,8 @@ name: figma-ppt-insert
 description: |
   Insert Figma-exported screen images into a PowerPoint template at marker shapes
   whose text is "[화면 교체 위치: {화면ID}]", or — on screen-definition decks without
-  markers — replace the existing screenshot on slides whose table has a "화면ID" cell.
+  markers — replace the existing screenshot on slides whose table has a "화면ID" cell
+  (or whose header text box holds just the screen ID, e.g. U-CAS-KVDS-AI-01; {ID}_n targets the nth such slide).
   Matching is by file name = Figma frame name = screen ID.
   Fits each image into the box (similar ratio: full width, top-aligned; very different
   ratio such as popups: centered; optional fill/crop),
@@ -44,8 +45,12 @@ description: |
 | 형식 점검 | 확장자와 실제 내용(Pillow)이 PNG/JPEG가 아니거나 열리지 않으면 건너뛰고 경고(그 파일은 그대로 둠) |
 | 마커 | 텍스트 전체가 `[화면 교체 위치: {화면ID}]`인 도형(사각형·텍스트상자·placeholder). 전각 콜론·공백 차이 허용 |
 | 화면ID 표 (마커 없는 슬라이드) | 표에 `화면ID` 칸이 있으면 바로 오른쪽 값이 ID. 슬라이드에서 가장 큰 그림(1 sq in 이상, 로고 제외)이 기존 화면으로 보고 그 영역·레이어에서 교체. 이미지가 없으면 기존 화면 유지 |
-| 우선순위 | 슬라이드마다 마커·이전 삽입 이미지 → 없을 때만 화면ID 표 |
-| 중복 ID | 같은 ID가 여러 슬라이드에 있으면 모두 같은 이미지로 교체 |
+| 화면ID 텍스트 (표도 없는 슬라이드) | 슬라이드 상단 15% 안에 텍스트 전체가 ID 모양(`U-CAS-KVDS-AI-01`처럼 하이픈 3단 이상)인 상자. 여럿이면 가장 왼쪽(오른쪽은 요구사항 ID). 이후는 화면ID 표와 동일. 그림 위에 얹힌 PPT 도형은 건드리지 않음 |
+| 우선순위 | 슬라이드마다 마커·이전 삽입 이미지 → 화면ID 표 → 화면ID 텍스트 |
+| 중복 ID | 같은 ID가 여러 슬라이드에 있으면 n번째 슬라이드는 `{ID}_n` 파일 우선, 없으면 `{ID}` 파일. 순번은 그 ID가 적힌 모든 슬라이드 기준(그림 없는 슬라이드 포함) |
+| 화면 위 도형 | 교체 영역(±0.05in) 안에 완전히 들어간 도형. `keep`이면 그대로, `clean`이면 삭제. 항상 유지: 번호 배지(0.5in 이하 채워진 도형, 텍스트 `1`·`2a`·`1-1`), 채움 없는 점선 테두리, 화살표·점선 선, 이것들로만 된 그룹 |
+| 헤더 포함 (`clean`만) | 화면 그림 바로 위(간격 0.1in 이내)에 화면 너비 90% 이상을 덮는 앱 헤더(슬라이드·레이아웃·마스터 도형)가 있으면 화면 영역을 그 헤더 위끝까지 늘려 새 이미지로 덮음. 피그마 export에 헤더가 포함된다는 전제 |
+| 작은 대상 경고 | 교체한 대상 그림이 덱 화면 넓이 중앙값의 70% 미만이면 `확인 필요`(차트 등일 수 있음) |
 | 최신 선택 | 같은 ID의 후보(`02_images` 파일·다운로드·옛 날짜 폴더) 중 시각이 가장 최근인 것(다운로드는 받은 시각, 나머지는 수정 시각). 같으면 이미 있던 파일, 그다음 png. 이긴 파일이 `02_images/{화면ID}.{확장자}`가 되고 나머지 프로젝트 파일은 `_archive`로 이동 |
 | 이름 정리 | `02_images`의 `{ID}@2x.png`, `{ID} (1).png` 같은 파일은 `{ID}.png`로 정리 |
 | 옛 날짜 폴더 | `02_images/YYYY-MM-DD/`가 있으면 같은 규칙으로 합치고 폴더 삭제(남은 파일은 `_archive`). 그 외 하위 폴더는 건너뛰고 경고 |
@@ -71,6 +76,7 @@ python .claude/skills/figma-ppt-insert/scripts/insert.py --project <프로젝트
 | `--new-project <이름>` | 빈 프로젝트 폴더 생성 후 종료 ("○○ 프로젝트 만들어줘") |
 | `--list` | 프로젝트 목록 |
 | `--mode fill` | 영역 채우기(잘림) |
+| `--overlay clean` | 교체한 화면 위에 얹힌 PPT 도형 삭제 (번호 배지·점선 테두리·화살표는 유지). 기본 `keep` = 그대로 둠 |
 | `--add-slides` | PPT에 없는 화면 ID 이미지마다 화면 슬라이드를 새로 만듦 ("새 화면 슬라이드도 추가해줘") |
 | `--download-days N` | 다운로드에서 최근 N일 안에 받은 파일까지 가져옴 (기본 1 = 오늘) |
 | `--no-downloads` | 다운로드에서 가져오지 않고 `02_images`만 사용 |
@@ -94,6 +100,8 @@ python .claude/skills/figma-ppt-insert/scripts/insert.py --project <프로젝트
 1. 대상 파일: 프로젝트명과 `01_template/`의 원본 파일명 (결과는 이 원본을 기준으로 `03_output/{원본파일명}_최종.pptx`에 새로 만들어짐)
 2. 가져올 이미지: 미리보기의 "다운로드에서 가져올 예정" 목록. 없으면 `02_images`의 기존 이미지만 쓴다고 알림.
    최근 이틀 파일 목록이 있으면 함께 넣을지도 같이 묻는다
+3. 화면 위 도형: 미리보기의 "화면 위 도형" 목록에 '그 외' 도형이 있는 페이지가 있으면 페이지와 개수를 보여 주고
+   **남길지(keep) / 지울지(clean, 번호 배지 등은 유지)** 묻는다. 없으면 묻지 않는다
 
 프로젝트가 여럿이고 사용자가 지정하지 않았으면 프로젝트별 원본 파일명을 나열해 어느 파일인지 묻는다.
 사용자가 대화에 첨부한 PPT가 `01_template`의 원본과 다르면 그 차이를 알리고, 원본을 교체할지 묻는다.

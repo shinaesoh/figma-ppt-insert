@@ -63,6 +63,7 @@ try:
     from PIL import Image
     from pptx import Presentation
     from pptx.enum.shapes import MSO_SHAPE_TYPE
+    from pptx.oxml.ns import qn
     from pptx.util import Emu, Inches, Pt
 except ImportError as exc:  # pragma: no cover - environment guard
     print(
@@ -82,6 +83,12 @@ ARCHIVE_KEEP = 10
 IMAGE_EXTS = (".png", ".jpg", ".jpeg")  # earlier = preferred on a same-time tie
 IMAGE_FORMATS = {"PNG", "JPEG"}  # actual content, checked with Pillow
 IGNORED_FILES = {".gitkeep", "thumbs.db", "desktop.ini", ".ds_store"}
+OVERLAY_KEEP = "keep"  # shapes drawn over the old screenshot stay as they are
+OVERLAY_CLEAN = "clean"  # remove them, keeping callout badges, dashed frames and arrows
+BADGE_MAX_IN = 0.5  # callout badges are small shapes holding just a number such as 1, 2a, 1-1
+OVERLAY_MARGIN_IN = 0.05
+HEADER_GAP_IN = 0.1  # a header bar ending this close to the screen top belongs to the screen
+HEADER_MIN_SHARE = 0.9  # ...when it spans at least this share of the screen width  # a shape counts as "on the screen" when inside the box plus this margin
 MODE_FIT = "fit"
 MODE_FILL = "fill"
 # Font for text this tool adds to slides (install-local font lock).
@@ -104,6 +111,8 @@ DESCRIPTION_PLACEHOLDER = (
     "피그마 export로 추가된 신규 화면입니다.",
     "화면명·화면타입·유형·화면 경로와 기능 설명을 입력하세요.",
 )
+SMALL_SCREEN_SHARE = 0.7  # target picture below this share of the median screen area is flagged
+HEADER_ZONE = 0.15  # an ID-only text box above this share of the slide height names the screen
 FOOTER_ZONE = 0.9  # shapes below this share of the slide height are footer (page number)
 FRAME_MIN_SHARE = 0.4  # empty rectangle covering this share of the slide = content frame
 DOWNLOADS_DIR = Path.home() / "Downloads"
@@ -118,6 +127,9 @@ _DATE_DIR_RE = re.compile(r"\d{4}-\d{2}-\d{2}")  # legacy date-folder layout
 _SCALE_SUFFIX_RE = re.compile(r"@\d+(?:\.\d+)?x$", re.IGNORECASE)
 _COPY_SUFFIX_RE = re.compile(r"\s*\(\d+\)$")  # browser duplicate: "UI-IMS-2001 (1).png"
 _TRAILING_DIGITS_RE = re.compile(r"\d+$")
+_ID_TEXT_RE = re.compile(r"[A-Za-z][A-Za-z0-9]*(?:-[A-Za-z0-9]+){2,}")  # e.g. U-CAS-KVDS-AI-01
+_BADGE_TEXT_RE = re.compile(r"\d{1,2}(?:[a-zA-Z]|-\d{1,2})?")
+_OCCURRENCE_RE = re.compile(r"^(?P<base>.+)_(?P<n>\d+)$")  # {ID}_{n}: nth slide with that ID
 _BAD_PROJECT_CHARS_RE = re.compile(r'[\\/:*?"<>|]')
 _NUMBER_SPLIT_RE = re.compile(r"(\d+)")
 _R_NS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
@@ -138,9 +150,10 @@ class Box:
 class Target:
     slide_no: int
     screen_id: str
-    kind: str  # "marker" | "picture" (inserted earlier) | "table" (화면ID table + screenshot)
+    kind: str  # "marker" | "picture" (inserted earlier) | "table" / "textbox" (화면ID + screenshot)
     box: Box
     element: object  # lxml element of the shape to replace
+    occurrence: int = 1  # nth slide carrying this ID, in deck order (matches {ID}_{n} files)
 
 
 @dataclass
@@ -155,6 +168,9 @@ class RunReport:
     inserted: list[tuple[Target, ImageEntry, str]] = field(default_factory=list)
     missing_image: list[Target] = field(default_factory=list)
     kept_existing: list[Target] = field(default_factory=list)
+    overlay: dict[int, tuple[int, int]] = field(default_factory=dict)  # slide -> (on screen, badges/frames)
+    overlay_mode: str = OVERLAY_KEEP
+    header_added: dict[int, float] = field(default_factory=dict)  # slide -> inches added on top
     unused_images: list[ImageEntry] = field(default_factory=list)
     imported: list[tuple[str, str]] = field(default_factory=list)  # (download name, dest)
     moved: list[tuple[str, str]] = field(default_factory=list)  # (old place, new name) in 02_images
@@ -222,6 +238,30 @@ def _table_screen_id(slide) -> Optional[str]:
     return None
 
 
+def _textbox_screen_id(slide, slide_height: float) -> Optional[str]:
+    """Screen ID written alone in a header text box (decks without a 화면ID table).
+
+    When several ID-shaped boxes sit in the header (screen ID left, requirement
+    ID right), the leftmost one is the screen ID.
+    """
+    found = []
+    for shape in slide.shapes:
+        if not getattr(shape, "has_text_frame", False) or shape.top is None:
+            continue
+        text = shape.text_frame.text.strip()
+        if _ID_TEXT_RE.fullmatch(text) and _emu_to_in(shape.top) < slide_height * HEADER_ZONE:
+            found.append((shape.left, text))
+    return min(found)[1] if found else None
+
+
+def _slide_screen_id(slide, slide_height: float) -> tuple[Optional[str], str]:
+    """(screen ID, "table" | "textbox") for a screen slide without markers."""
+    screen_id = _table_screen_id(slide)
+    if screen_id:
+        return screen_id, "table"
+    return _textbox_screen_id(slide, slide_height), "textbox"
+
+
 def _largest_picture(slide):
     pictures = [
         s for s in slide.shapes
@@ -235,18 +275,33 @@ def find_targets(prs, report: RunReport) -> list[Target]:
     """Collect targets slide by slide.
 
     A slide with markers or previously inserted pictures uses those. Otherwise,
-    when a table carries a "화면ID" cell, the slide's largest picture (the
-    existing screenshot) becomes the target and keeps its box and z-order.
+    when a table carries a "화면ID" cell (or a header text box holds just the
+    ID), the slide's largest picture (the existing screenshot) becomes the
+    target and keeps its box and z-order. Each target records which occurrence
+    of its ID it is, so ``{ID}_2`` can go to the second slide with that ID.
     """
     targets: list[Target] = []
+    slide_height = _emu_to_in(prs.slide_height)
+    seen: dict[str, int] = {}  # slides so far per ID, counting ID slides with no picture too
+
+    def count(screen_id: str) -> int:
+        seen[_key(screen_id)] = seen.get(_key(screen_id), 0) + 1
+        return seen[_key(screen_id)]
+
     for slide_no, slide in enumerate(prs.slides, start=1):
         before = len(targets)
         has_group_marker = _scan_slide(slide, slide_no, targets, report)
         if has_group_marker or len(targets) > before:
+            occurrences = {_key(t.screen_id): 0 for t in targets[before:]}
+            for target in targets[before:]:
+                key = _key(target.screen_id)
+                occurrences[key] = occurrences[key] or count(target.screen_id)
+                target.occurrence = occurrences[key]
             continue
-        screen_id = _table_screen_id(slide)
+        screen_id, kind = _slide_screen_id(slide, slide_height)
         if not screen_id:
             continue
+        occurrence = count(screen_id)
         picture = _largest_picture(slide)
         if picture is None:
             report.warnings.append(
@@ -254,8 +309,29 @@ def find_targets(prs, report: RunReport) -> list[Target]:
                 "마커 도형을 넣어 주세요."
             )
             continue
-        targets.append(Target(slide_no, screen_id, "table", _shape_box(picture), picture._element))
+        targets.append(
+            Target(slide_no, screen_id, kind, _shape_box(picture), picture._element, occurrence)
+        )
     return targets
+
+
+def _warn_small_screens(targets: list[Target], replaced: list[Target], report: RunReport) -> None:
+    """Flag a "largest picture" that is much smaller than the deck's usual screen.
+
+    On pages drawn mostly with shapes the largest picture can be a chart or a
+    heatmap rather than the screen itself.
+    """
+    picked = [t for t in targets if t.kind in ("table", "textbox")]
+    if len(picked) < 3:
+        return
+    areas = sorted(t.box.width * t.box.height for t in picked)
+    usual = areas[len(areas) // 2]
+    for target in replaced:
+        if target.kind in ("table", "textbox") and target.box.width * target.box.height < usual * SMALL_SCREEN_SHARE:
+            report.warnings.append(
+                f"슬라이드 {target.slide_no}: 교체 대상 그림({target.box.width:.1f}×{target.box.height:.1f}in)이 "
+                "다른 화면보다 작습니다 — 화면 전체가 아니라 차트 등 일부 그림일 수 있으니 결과를 확인하세요."
+            )
 
 
 def _scan_slide(slide, slide_no: int, targets: list[Target], report: RunReport) -> bool:
@@ -316,7 +392,8 @@ def _clean_stem(file_name: str) -> str:
 def deck_screen_ids(prs) -> set[str]:
     """Screen IDs the deck already knows (markers, inserted pictures, 화면ID tables)."""
     ids = {_key(t.screen_id) for t in find_targets(prs, RunReport())}
-    ids.update(_key(sid) for sid in map(_table_screen_id, prs.slides) if sid)
+    height = _emu_to_in(prs.slide_height)
+    ids.update(_key(sid) for sid, _ in (_slide_screen_id(s, height) for s in prs.slides) if sid)
     return ids
 
 
@@ -336,13 +413,17 @@ class _IdMatcher:
 
     def screen_id(self, file_name: str) -> Optional[str]:
         stem = _clean_stem(file_name)
-        key = _key(stem)
+        occurrence = _OCCURRENCE_RE.match(stem)
+        base = occurrence.group("base") if occurrence else stem
+        return stem if self._is_id(base) else None
+
+    def _is_id(self, text: str) -> bool:
+        key = _key(text)
         if key in self.known:
-            return stem
-        for prefix in self.prefixes:
-            if key.startswith(prefix) and key[len(prefix):].isdigit():
-                return stem
-        return None
+            return True
+        return any(
+            key.startswith(prefix) and key[len(prefix):].isdigit() for prefix in self.prefixes
+        )
 
 
 def _download_time(path: Path) -> float:
@@ -670,18 +751,124 @@ def place_image(slide, target: Target, image: ImageEntry, mode: str) -> tuple[st
     return placement, _effective_ppi(size, region, placement)
 
 
-def run_insert(prs, images: dict[str, ImageEntry], mode: str, report: RunReport) -> None:
+def _inside(shape, region: Box) -> bool:
+    if shape.left is None or shape.width is None:
+        return False
+    box, m = _shape_box(shape), OVERLAY_MARGIN_IN
+    return (
+        box.left >= region.left - m
+        and box.top >= region.top - m
+        and box.left + box.width <= region.left + region.width + m
+        and box.top + box.height <= region.top + region.height + m
+    )
+
+
+def _is_annotation(shape) -> bool:
+    """Explanation marks the planner drew over the screen, as opposed to drawn UI.
+
+    - callout badge: small filled auto shape holding just a number (1, 2a, 1-1)
+    - highlight frame: empty auto shape with no fill and a dashed outline
+    - pointer: a line or connector with an arrowhead or a dashed stroke
+    A group counts only when everything in it is an annotation.
+    """
+    if shape.shape_type == MSO_SHAPE_TYPE.GROUP:
+        return all(_is_annotation(child) for child in shape.shapes)
+    sp_pr = shape._element.find(qn("p:spPr"))
+    line = sp_pr.find(qn("a:ln")) if sp_pr is not None else None
+    dash = line.find(qn("a:prstDash")) if line is not None else None
+    dashed = dash is not None and dash.get("val", "solid") != "solid"
+    if shape.shape_type == MSO_SHAPE_TYPE.LINE or shape._element.tag.endswith("}cxnSp"):
+        arrow = line is not None and any(
+            end is not None and end.get("type", "none") != "none"
+            for end in (line.find(qn("a:headEnd")), line.find(qn("a:tailEnd")))
+        )
+        return arrow or dashed
+    if shape.shape_type != MSO_SHAPE_TYPE.AUTO_SHAPE:
+        return False
+    text = shape.text_frame.text.strip() if shape.has_text_frame else ""
+    no_fill = sp_pr is not None and sp_pr.find(qn("a:noFill")) is not None
+    small = _emu_to_in(shape.width) <= BADGE_MAX_IN and _emu_to_in(shape.height) <= BADGE_MAX_IN
+    if text:
+        return small and not no_fill and bool(_BADGE_TEXT_RE.fullmatch(text))
+    return no_fill and dashed
+
+
+def _header_top(slide, region: Box) -> Optional[float]:
+    """Top of an app header bar drawn just above the screen picture, if any.
+
+    Some decks put the app's top bar (logo, menu) in the slide layout or as a
+    shape right above the screenshot. A Figma export includes that bar, so in
+    clean mode the screen box grows upward to cover it.
+    """
+    candidates = list(slide.shapes)
+    for owner in (slide.slide_layout, slide.slide_layout.slide_master):
+        candidates += [s for s in owner.shapes if not s.is_placeholder]
+    best: Optional[float] = None
+    for shape in candidates:
+        if shape.left is None or shape.width is None or shape.name.startswith(PIC_NAME_PREFIX):
+            continue
+        box = _shape_box(shape)
+        bottom = box.top + box.height
+        overlap = min(box.left + box.width, region.left + region.width) - max(box.left, region.left)
+        if (
+            box.top < region.top - HEADER_GAP_IN
+            and abs(bottom - region.top) <= HEADER_GAP_IN
+            and overlap >= region.width * HEADER_MIN_SHARE
+            and box.width <= region.width * (2 - HEADER_MIN_SHARE)
+        ):
+            best = box.top if best is None else min(best, box.top)
+    return best
+
+
+def handle_overlay(slide, region: Box, clean: bool) -> tuple[int, int]:
+    """Count (and in clean mode remove) shapes drawn over the screen region.
+
+    Returns (shapes on the screen, annotations among them). Inserted Figma
+    pictures are never touched; annotations are always kept.
+    """
+    on_screen = annotations = 0
+    for shape in list(slide.shapes):
+        if shape.name.startswith(PIC_NAME_PREFIX) or not _inside(shape, region):
+            continue
+        on_screen += 1
+        if _is_annotation(shape):
+            annotations += 1
+        elif clean:
+            element = shape._element
+            rids = set(element.xpath(".//@r:embed"))
+            element.getparent().remove(element)
+            for rid in rids:
+                if not slide._element.xpath(f'.//@r:embed[. = "{rid}"]'):
+                    slide.part.rels.pop(rid)
+    return on_screen, annotations
+
+
+def run_insert(
+    prs, images: dict[str, ImageEntry], mode: str, report: RunReport, overlay: str = OVERLAY_KEEP
+) -> None:
     targets = find_targets(prs, report)
     used: set[str] = set()
     for target in targets:
-        image = images.get(_key(target.screen_id))
+        numbered = _key(f"{target.screen_id}_{target.occurrence}")
+        image_key = numbered if numbered in images else _key(target.screen_id)
+        image = images.get(image_key)
         if image is None:
             if target.kind == "marker":
                 report.missing_image.append(target)
-            elif target.kind == "table":
+            elif target.kind in ("table", "textbox"):
                 report.kept_existing.append(target)
             continue
-        placement, ppi = place_image(prs.slides[target.slide_no - 1], target, image, mode)
+        slide = prs.slides[target.slide_no - 1]
+        if overlay == OVERLAY_CLEAN and target.kind != "picture":
+            header = _header_top(slide, target.box)
+            if header is not None:
+                added = target.box.top - header
+                target.box = Box(target.box.left, header, target.box.width, target.box.height + added)
+                report.header_added[target.slide_no] = added
+        placement, ppi = place_image(slide, target, image, mode)
+        on_screen, annotations = handle_overlay(slide, target.box, overlay == OVERLAY_CLEAN)
+        if on_screen:
+            report.overlay[target.slide_no] = (on_screen, annotations)
         if ppi < MIN_PPI:
             width, height = _image_size(image.path)
             report.warnings.append(
@@ -690,8 +877,9 @@ def run_insert(prs, images: dict[str, ImageEntry], mode: str, report: RunReport)
                 "피그마에서 배율 2x로 다시 export하세요."
             )
         report.inserted.append((target, image, placement))
-        used.add(_key(target.screen_id))
+        used.add(image_key)
     report.unused_images = [img for key, img in sorted(images.items()) if key not in used]
+    _warn_small_screens(targets, [t for t, _, _ in report.inserted], report)
 
 
 def _natural_key(text: str) -> list:
@@ -881,9 +1069,12 @@ def add_missing_slides(prs, images: dict[str, ImageEntry], report: RunReport) ->
     pass. Page numbers of later slides are shifted to match.
     """
     present = {_key(t.screen_id) for t in find_targets(prs, RunReport())}
-    new_ids = sorted(
-        (img.screen_id for key, img in images.items() if key not in present), key=_natural_key
-    )
+
+    def is_new(key: str) -> bool:
+        numbered = _OCCURRENCE_RE.match(key)
+        return key not in present and not (numbered and numbered.group("base") in present)
+
+    new_ids = sorted((img.screen_id for key, img in images.items() if is_new(key)), key=_natural_key)
     if not new_ids:
         return []
     screen = _screen_box(prs)
@@ -989,6 +1180,7 @@ def format_report(
     archived: Optional[Path],
     pruned: list[Path],
 ) -> str:
+    report_overlay_mode = report.overlay_mode
     mode_label = "비율 유지 맞춤(fit)" if mode == MODE_FIT else "영역 채우기·잘림(fill)"
     lines = [
         f"## {started:%Y-%m-%d %H:%M} 실행",
@@ -1019,7 +1211,8 @@ def format_report(
     if report.inserted:
         lines += ["| 슬라이드 | 화면 ID | 사용 이미지 | 대상 | 배치 |", "|---|---|---|---|---|"]
         for target, image, placement in report.inserted:
-            kind = {"marker": "마커", "picture": "삽입 이미지 교체", "table": "화면ID 표·기존 화면 교체"}[
+            kind = {"marker": "마커", "picture": "삽입 이미지 교체", "table": "화면ID 표·기존 화면 교체",
+                    "textbox": "화면ID 텍스트·기존 화면 교체"}[
                 target.kind
             ]
             lines.append(
@@ -1027,6 +1220,18 @@ def format_report(
             )
     else:
         lines.append("- 없음")
+    if report.overlay:
+        clean = report_overlay_mode == OVERLAY_CLEAN
+        title = "화면 위 도형 — 삭제(번호 배지·점선 테두리·화살표는 남김)" if clean else "화면 위 도형 — 그대로 남김"
+        lines += ["", f"### {title} ({len(report.overlay)})", ""]
+        for slide_no, (on_screen, kept) in sorted(report.overlay.items()):
+            others = on_screen - kept
+            if clean:
+                header = report.header_added.get(slide_no)
+                note = f", 위쪽 헤더 {header:.2f}in까지 화면 영역에 포함" if header else ""
+                lines.append(f"- 슬라이드 {slide_no}: {others}개 삭제, 번호 배지 등 {kept}개 유지{note}")
+            else:
+                lines.append(f"- 슬라이드 {slide_no}: {on_screen}개 남음 (번호 배지 등 {kept}개, 그 외 {others}개)")
     if added:
         new_pages = [t for t, _, _ in report.inserted if _key(t.screen_id) in {_key(a) for a in added}]
         lines += ["", f"### 새 슬라이드 추가 ({len(added)})", ""]
@@ -1132,6 +1337,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="fit: keep ratio inside the box (default); fill: cover the box and crop",
     )
     parser.add_argument(
+        "--overlay",
+        choices=(OVERLAY_KEEP, OVERLAY_CLEAN),
+        default=OVERLAY_KEEP,
+        help="shapes drawn over a replaced screen: keep (default) or clean "
+        "(remove them, keeping callout badges, dashed frames and arrows)",
+    )
+    parser.add_argument(
         "--add-slides",
         action="store_true",
         help="add a screen page (cloned layout) for images whose ID has no slide yet",
@@ -1184,7 +1396,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         return 1
     started = datetime.now()
 
-    report = RunReport()
+    report = RunReport(overlay_mode=args.overlay)
     prs = Presentation(str(template))
     downloads = (
         []
@@ -1198,7 +1410,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             root / IMAGES_DIR, downloads, report, dry_run=args.dry_run, scratch=Path(scratch)
         )
         added = add_missing_slides(prs, images, report) if args.add_slides else []
-        run_insert(prs, images, args.mode, report)
+        run_insert(prs, images, args.mode, report, args.overlay)
 
     final_path: Optional[Path] = None
     archived: Optional[Path] = None
