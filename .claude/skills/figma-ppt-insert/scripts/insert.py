@@ -21,6 +21,11 @@ Project layout (one folder per project under <repo>/projects/):
     projects/{project}/03_output/_archive/         previous results (newest 10 kept)
     projects/{project}/insert_log.md               cumulative run log
 
+Before matching, exports downloaded today (names shaped like the deck's screen
+IDs, or Figma zip exports of them) are moved from ~/Downloads into
+02_images/{download date}/; matching files from the two days before are only
+reported.
+
 Usage:
     python3 .claude/skills/figma-ppt-insert/scripts/insert.py [options]
 
@@ -29,6 +34,7 @@ Examples:
     python3 .claude/skills/figma-ppt-insert/scripts/insert.py --project IMS
     python3 .claude/skills/figma-ppt-insert/scripts/insert.py --project IMS --mode fill
     python3 .claude/skills/figma-ppt-insert/scripts/insert.py --project IMS --dry-run
+    python3 .claude/skills/figma-ppt-insert/scripts/insert.py --project IMS --download-days 3
     python3 .claude/skills/figma-ppt-insert/scripts/insert.py --list
 
 Dependencies:
@@ -39,7 +45,9 @@ from __future__ import annotations
 import argparse
 import copy
 import re
+import shutil
 import sys
+import zipfile
 from dataclasses import dataclass, field
 from datetime import date, datetime
 from pathlib import Path
@@ -95,12 +103,18 @@ DESCRIPTION_PLACEHOLDER = (
 )
 FOOTER_ZONE = 0.9  # shapes below this share of the slide height are footer (page number)
 FRAME_MIN_SHARE = 0.4  # empty rectangle covering this share of the slide = content frame
+DOWNLOADS_DIR = Path.home() / "Downloads"
+DOWNLOAD_DAYS = 1  # import exports downloaded today (1) or within the last N days
+NOTICE_DAYS = 2  # older downloads within this many extra days are only reported
+ZIP_DIR = "_zip"  # imported Figma zip exports are kept here inside the date folder
 PIC_NAME_PREFIX = "FIGMA:"
 REGION_TAG = "figma-ppt-insert region_in="
 
 _MARKER_RE = re.compile(r"\[\s*화면\s*교체\s*위치\s*[:：]\s*(?P<id>[^\]\s]+)\s*\]")
 _DATE_DIR_RE = re.compile(r"\d{4}-\d{2}-\d{2}")
 _SCALE_SUFFIX_RE = re.compile(r"@\d+(?:\.\d+)?x$", re.IGNORECASE)
+_COPY_SUFFIX_RE = re.compile(r"\s*\(\d+\)$")  # browser duplicate: "UI-IMS-2001 (1).png"
+_TRAILING_DIGITS_RE = re.compile(r"\d+$")
 _BAD_PROJECT_CHARS_RE = re.compile(r'[\\/:*?"<>|]')
 _NUMBER_SPLIT_RE = re.compile(r"(\d+)")
 _R_NS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
@@ -139,6 +153,8 @@ class RunReport:
     missing_image: list[Target] = field(default_factory=list)
     kept_existing: list[Target] = field(default_factory=list)
     unused_images: list[ImageEntry] = field(default_factory=list)
+    imported: list[tuple[str, str]] = field(default_factory=list)  # (download name, dest)
+    recent_downloads: list[tuple[str, date]] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
 
 
@@ -337,6 +353,152 @@ def collect_images(images_root: Path, report: RunReport) -> dict[str, ImageEntry
                 in_folder[key] = ImageEntry(screen_id, path, folder.name)
         latest.update(in_folder)
     return latest
+
+
+def deck_screen_ids(prs) -> set[str]:
+    """Screen IDs the deck already knows (markers, inserted pictures, 화면ID tables)."""
+    ids = {_key(t.screen_id) for t in find_targets(prs, RunReport())}
+    ids.update(_key(sid) for sid in map(_table_screen_id, prs.slides) if sid)
+    return ids
+
+
+class _IdMatcher:
+    """Tell export files from unrelated downloads by the deck's screen-ID shape.
+
+    A name counts when it is a known ID or a known ID prefix followed by digits
+    (``UI-IMS-2001`` in the deck lets ``UI-IMS-2402`` in as a new screen).
+    """
+
+    def __init__(self, known_ids: set[str]) -> None:
+        self.known = known_ids
+        self.prefixes = {
+            _TRAILING_DIGITS_RE.sub("", sid) for sid in known_ids if _TRAILING_DIGITS_RE.search(sid)
+        }
+        self.prefixes.discard("")
+
+    def screen_id(self, file_name: str) -> Optional[str]:
+        stem = _COPY_SUFFIX_RE.sub("", Path(file_name).stem)
+        stem = _SCALE_SUFFIX_RE.sub("", stem).strip()
+        key = _key(stem)
+        if key in self.known:
+            return stem
+        for prefix in self.prefixes:
+            if key.startswith(prefix) and key[len(prefix):].isdigit():
+                return stem
+        return None
+
+
+def _download_time(path: Path) -> float:
+    # Some copies keep the original mtime; creation (birth) time is when it landed here.
+    # st_ctime is not used: on recent Windows Pythons it is the metadata-change time.
+    stat = path.stat()
+    return max(stat.st_mtime, getattr(stat, "st_birthtime", 0.0))
+
+
+def _download_date(path: Path) -> date:
+    return datetime.fromtimestamp(_download_time(path)).date()
+
+
+def _zip_members(path: Path, matcher: _IdMatcher) -> list[tuple[str, str]]:
+    """(member name, screen ID) for image members of a Figma zip export."""
+    try:
+        with zipfile.ZipFile(path) as archive:
+            names = archive.namelist()
+    except (zipfile.BadZipFile, OSError):
+        return []
+    found = []
+    for name in names:
+        base = Path(name).name
+        if Path(base).suffix.lower() in IMAGE_EXTS:
+            screen_id = matcher.screen_id(base)
+            if screen_id:
+                found.append((name, screen_id))
+    return found
+
+
+def import_downloads(
+    downloads: Path,
+    images_root: Path,
+    matcher: _IdMatcher,
+    report: RunReport,
+    *,
+    days: int,
+    dry_run: bool,
+) -> None:
+    """Move recent Figma exports from Downloads into 02_images/{download date}/.
+
+    Images (and zip exports holding images) whose name looks like a screen ID
+    and that were downloaded within ``days`` days are moved; the newest file
+    wins per ID. Matching files from the ``NOTICE_DAYS`` days before that are
+    only listed in the report so the user can decide.
+    """
+    if not downloads.is_dir():
+        report.warnings.append(f"다운로드 폴더를 찾을 수 없어 가져오지 않았습니다: `{downloads}`")
+        return
+    today = date.today()
+    # screen key -> (download time, file, zip member or None, screen ID)
+    newest: dict[str, tuple[float, Path, Optional[str], str]] = {}
+    candidates: set[Path] = set()
+    for path in sorted(downloads.iterdir()):
+        if not path.is_file() or _is_ignorable(path):
+            continue
+        ext = path.suffix.lower()
+        if ext == ".zip":
+            entries = _zip_members(path, matcher)
+        elif ext in IMAGE_EXTS:
+            sid = matcher.screen_id(path.name)
+            entries = [(None, sid)] if sid else []
+        else:
+            continue
+        if not entries:
+            continue
+        day = _download_date(path)
+        age = (today - day).days
+        if age >= days:
+            if age < days + NOTICE_DAYS:
+                report.recent_downloads.append((path.name, day))
+            continue
+        candidates.add(path)
+        stamp = _download_time(path)
+        for member, sid in entries:
+            key = _key(sid)
+            if key not in newest or stamp > newest[key][0]:
+                newest[key] = (stamp, path, member, sid)
+
+    used: set[Path] = set()
+    for stamp, path, member, sid in sorted(newest.values(), key=lambda v: _natural_key(v[3])):
+        ext = Path(member or path.name).suffix.lower()
+        day = _download_date(path)
+        dest = images_root / day.isoformat() / f"{sid}{ext}"
+        if any(
+            f.stat().st_mtime >= stamp
+            for f in (dest.with_suffix(e) for e in IMAGE_EXTS)
+            if f.is_file()
+        ):
+            continue  # an equal or newer export of this ID is already in the project
+        source = f"{path.name} → {Path(member).name}" if member else path.name
+        report.imported.append((source, f"{IMAGES_DIR}/{day.isoformat()}/{dest.name}"))
+        used.add(path)
+        if dry_run:
+            continue
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        if member:
+            with zipfile.ZipFile(path) as archive:
+                dest.write_bytes(archive.read(member))
+        else:
+            dest.unlink(missing_ok=True)  # a same-day re-export replaces the earlier one
+            shutil.move(str(path), str(dest))
+
+    for path in sorted(candidates - used):
+        report.warnings.append(
+            f"다운로드의 `{path.name}`은 같은 화면 ID의 더 최근 파일이 있어 가져오지 않았습니다."
+        )
+    if dry_run:
+        return
+    for path in sorted(p for p in used if p.suffix.lower() == ".zip"):
+        zip_dir = images_root / _download_date(path).isoformat() / ZIP_DIR
+        zip_dir.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(path), str(_unique_path(zip_dir / path.name)))
 
 
 def _image_size(path: Path) -> tuple[int, int]:
@@ -774,6 +936,13 @@ def format_report(
         lines.append(f"- 이전 최종본 보관: `{_rel(archived, root)}`")
     for path in pruned:
         lines.append(f"- 보관 개수 초과로 삭제: `{_rel(path, root)}`")
+    imported_title = "다운로드에서 가져옴" if final_path else "다운로드에서 가져올 예정 (미리보기 — 옮기지 않음, 아래 매칭에 미반영)"
+    lines += ["", f"### {imported_title} ({len(report.imported)})", ""]
+    lines += [f"- `{src}` → `{dest}`" for src, dest in report.imported] or ["- 없음"]
+    if report.recent_downloads:
+        lines += ["", f"### 다운로드 — 최근 파일, 가져오지 않음 ({len(report.recent_downloads)})", ""]
+        lines += [f"- `{name}` ({day:%m-%d})" for name, day in report.recent_downloads]
+        lines.append("- 넣으려면 `--download-days 3`으로 다시 실행하세요.")
     lines += ["", f"### 삽입 성공 ({len(report.inserted)})", ""]
     if report.inserted:
         lines += ["| 슬라이드 | 화면 ID | 사용 이미지 | 대상 | 배치 |", "|---|---|---|---|---|"]
@@ -896,6 +1065,24 @@ def build_parser() -> argparse.ArgumentParser:
         help="add a screen page (cloned layout) for images whose ID has no slide yet",
     )
     parser.add_argument(
+        "--downloads",
+        type=Path,
+        default=DOWNLOADS_DIR,
+        help=f"folder to pick up Figma exports from (default: {DOWNLOADS_DIR})",
+    )
+    parser.add_argument(
+        "--download-days",
+        type=int,
+        default=DOWNLOAD_DAYS,
+        metavar="N",
+        help="import exports downloaded within the last N days (default: 1 = today)",
+    )
+    parser.add_argument(
+        "--no-downloads",
+        action="store_true",
+        help="do not import from the downloads folder; use 02_images only",
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
         help="report matches only; do not save, archive, or log",
@@ -926,8 +1113,17 @@ def main(argv: Optional[list[str]] = None) -> int:
     started = datetime.now()
 
     report = RunReport()
-    images = collect_images(root / IMAGES_DIR, report)
     prs = Presentation(str(template))
+    if not args.no_downloads:
+        import_downloads(
+            args.downloads,
+            root / IMAGES_DIR,
+            _IdMatcher(deck_screen_ids(prs)),
+            report,
+            days=max(args.download_days, 1),
+            dry_run=args.dry_run,
+        )
+    images = collect_images(root / IMAGES_DIR, report)
     added = add_missing_slides(prs, images, report) if args.add_slides else []
     run_insert(prs, images, args.mode, report)
 
